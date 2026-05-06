@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+data/raw/
+data/models/
+data/output/
+data/input/
+
+svenskaspel_statistik.html
