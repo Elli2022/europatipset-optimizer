@@ -12,17 +12,32 @@
 - Branch: `main`
 - Main file path: `streamlit_app.py`
 
-## 3) Secrets / environment variables
+## 3) Secrets (API-nyckel – var klistrar du in den?)
 
-Add in Streamlit app **Settings -> Secrets**:
+På **Streamlit Community Cloud**:
+
+1. Öppna din deployade app på `share.streamlit.io`
+2. Klicka på **⋮** (tre prickar) uppe till höger → **Manage app** (eller liknande meny)
+3. Välj fliken **Secrets** (ibland under **Settings**)
+4. Klistra in:
 
 ```toml
-FOOTBALL_DATA_API_KEY="din_api_nyckel"
+FOOTBALL_DATA_API_KEY = "din_nyckel_fran_football_data_org"
+```
+
+5. Spara och välj **Reboot app** om den inte startar om själv
+
+**OBS:** Nyckeln behövs för knappen *Synka API-historik*. Den används **inte** för att skapa `calibration.pkl` – modellen hämtar historik från football-data.co.uk vid första start.
+
+Valfritt (färre säsonger = snabbare första träning på Cloud):
+
+```toml
+BOOTSTRAP_HISTORY_YEARS = "3"
 ```
 
 ## 4) Post-deploy smoke tests
 
-- Open app URL
+- Open app URL — första gången kan sidan visa spinner **1–4 min** medan modellen tränas
 - Click `Synka API-historik nu`
 - Click `Hämta officiell kupong och beräkna förslag`
 - Verify week/day/date header appears

@@ -12,11 +12,13 @@ from europatipset import (
     assess_forecast_confidence,
     auto_refresh_official_snapshot,
     backtest_strategies,
+    download_historical_data,
     fetch_official_coupon_state,
     recommend_max_stake,
     simulate_rights_distribution,
     suggest_system,
     sync_history_from_free_api,
+    train_model,
     validate_coupon_data,
 )
 
@@ -30,6 +32,33 @@ OFFICIAL_COUPON_PATH = INPUT_DIR / "official_coupon.csv"
 RECOMMENDATION_PATH = OUTPUT_DIR / "recommendation_official.csv"
 API_HISTORY_PATH = DATA_DIR / "raw" / "history_api.csv"
 OFFICIAL_META_PATH = INPUT_DIR / "official_meta.json"
+HISTORY_CSV = DATA_DIR / "raw" / "history.csv"
+
+
+def _inject_streamlit_secrets_into_env() -> None:
+    """Streamlit Cloud: secrets.toml → os.environ (så befintlig kod med getenv fungerar)."""
+    try:
+        sec = st.secrets
+        if "FOOTBALL_DATA_API_KEY" in sec and not os.getenv("FOOTBALL_DATA_API_KEY"):
+            os.environ["FOOTBALL_DATA_API_KEY"] = str(sec["FOOTBALL_DATA_API_KEY"])
+    except Exception:
+        pass
+
+
+def _bootstrap_calibration_model_if_missing(history_years: int = 3) -> tuple[bool, str]:
+    """På Streamlit Cloud finns ingen committad .pkl – bygg modell första gången."""
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "raw").mkdir(parents=True, exist_ok=True)
+    if MODEL_PATH.exists():
+        return True, ""
+    try:
+        download_historical_data(HISTORY_CSV, back_years=history_years)
+        train_model(HISTORY_CSV, MODEL_PATH)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
 
 WEEKDAYS_SV = {
     0: "Måndag",
@@ -156,6 +185,30 @@ def _risk_level(confidence_label: str, warning_count: int) -> tuple[str, str, st
 
 
 st.set_page_config(page_title="Europatipset Optimizer", page_icon="⚽", layout="wide")
+_inject_streamlit_secrets_into_env()
+
+_bootstrap_years = 3
+try:
+    _bootstrap_years = int(st.secrets.get("BOOTSTRAP_HISTORY_YEARS", 3))
+except Exception:
+    pass
+
+if not MODEL_PATH.exists():
+    with st.spinner(
+        "Första starten: hämtar matchhistorik och tränar modell (kan ta 1–4 minuter på Streamlit Cloud)..."
+    ):
+        ok_bootstrap, bootstrap_err = _bootstrap_calibration_model_if_missing(history_years=_bootstrap_years)
+    if not ok_bootstrap:
+        st.error(
+            "Kunde inte skapa modellen automatiskt på servern.\n\n"
+            f"**Fel:** `{bootstrap_err}`\n\n"
+            "**Gör så här:** Kör lokalt:\n"
+            "`python europatipset.py download --years 3 --out data/raw/history.csv` och "
+            "`python europatipset.py train --history data/raw/history.csv --model data/models/calibration.pkl`, "
+            "lägg sedan till filen `data/models/calibration.pkl` i repot och pusha — eller försök deploy igen."
+        )
+        st.stop()
+
 st.title("Europatipset Optimizer")
 st.caption("Användarvänligt stöd för att välja tecken med sannolikhet, streckvärde och scenarios.")
 st.markdown(
@@ -243,21 +296,18 @@ if "backtest_df" not in st.session_state:
     st.session_state["backtest_df"] = None
 
 if st.button("Hämta officiell kupong och beräkna förslag", type="primary", use_container_width=True):
-    if not MODEL_PATH.exists():
-        st.error("Modell saknas. Kör först: python europatipset.py train --history data/raw/history.csv --model data/models/calibration.pkl")
-    else:
-        with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
-            try:
-                coupon_df, meta = fetch_official_coupon_state()
-                INPUT_DIR.mkdir(parents=True, exist_ok=True)
-                coupon_df.to_csv(OFFICIAL_COUPON_PATH, index=False)
-                result_df = _run_recommendation(max_rows=max_rows)
-                st.session_state["coupon_df"] = coupon_df
-                st.session_state["result_df"] = result_df
-                st.session_state["meta"] = meta
-                st.session_state["forecast_dist"] = None
-            except Exception as exc:
-                st.error(f"Kunde inte hämta eller beräkna kupong: {exc}")
+    with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
+        try:
+            coupon_df, meta = fetch_official_coupon_state()
+            INPUT_DIR.mkdir(parents=True, exist_ok=True)
+            coupon_df.to_csv(OFFICIAL_COUPON_PATH, index=False)
+            result_df = _run_recommendation(max_rows=max_rows)
+            st.session_state["coupon_df"] = coupon_df
+            st.session_state["result_df"] = result_df
+            st.session_state["meta"] = meta
+            st.session_state["forecast_dist"] = None
+        except Exception as exc:
+            st.error(f"Kunde inte hämta eller beräkna kupong: {exc}")
 
 if st.session_state["result_df"] is not None and st.session_state["coupon_df"] is not None:
     try:
