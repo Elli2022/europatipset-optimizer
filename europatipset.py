@@ -1,7 +1,9 @@
 import argparse
 import json
 import math
+import os
 import pickle
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -9,6 +11,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from sklearn.linear_model import LogisticRegression
 
 
@@ -24,6 +27,24 @@ LEAGUE_CODES = [
     "B1",   # Belgian Pro League
     "T1",   # Super Lig
 ]
+
+load_dotenv()
+
+COMPETITION_CODES = [
+    "PL",   # Premier League
+    "ELC",  # Championship
+    "PD",   # La Liga
+    "BL1",  # Bundesliga
+    "SA",   # Serie A
+    "FL1",  # Ligue 1
+    "DED",  # Eredivisie
+    "PPL",  # Primeira Liga
+]
+
+GAME_TYPES = {
+    "europatipset": {"match_count": 13, "row_price": 1.0},
+    "topptipset": {"match_count": 8, "row_price": 1.0},
+}
 
 
 def season_codes(back_years: int = 6) -> List[str]:
@@ -58,6 +79,81 @@ def download_historical_data(out_file: Path, back_years: int = 6) -> pd.DataFram
     out_file.parent.mkdir(parents=True, exist_ok=True)
     full.to_csv(out_file, index=False)
     return full
+
+
+def sync_history_from_free_api(
+    out_file: Path,
+    days_back: int = 120,
+    api_key: str | None = None,
+) -> pd.DataFrame:
+    """
+    Pull finished matches from football-data.org (free tier).
+    Stores a simple historical dataset for continuous updates.
+    """
+    key = api_key or os.getenv("FOOTBALL_DATA_API_KEY")
+    if not key:
+        raise RuntimeError("Sätt FOOTBALL_DATA_API_KEY för att hämta historik från API.")
+
+    base_url = "https://api.football-data.org/v4"
+    headers = {"X-Auth-Token": key}
+    date_from = (pd.Timestamp.now("UTC") - pd.Timedelta(days=days_back)).date().isoformat()
+    date_to = pd.Timestamp.now("UTC").date().isoformat()
+
+    rows: List[Dict] = []
+    for code in COMPETITION_CODES:
+        url = f"{base_url}/competitions/{code}/matches"
+        params = {"status": "FINISHED", "dateFrom": date_from, "dateTo": date_to}
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            matches = payload.get("matches", [])
+            for m in matches:
+                home = (m.get("homeTeam") or {}).get("name")
+                away = (m.get("awayTeam") or {}).get("name")
+                score = (m.get("score") or {}).get("fullTime") or {}
+                hg = score.get("home")
+                ag = score.get("away")
+                if home is None or away is None or hg is None or ag is None:
+                    continue
+                if hg > ag:
+                    ftr = "H"
+                elif hg == ag:
+                    ftr = "D"
+                else:
+                    ftr = "A"
+                rows.append(
+                    {
+                        "Date": m.get("utcDate", "")[:10],
+                        "HomeTeam": home,
+                        "AwayTeam": away,
+                        "FTHG": hg,
+                        "FTAG": ag,
+                        "FTR": ftr,
+                        "Competition": code,
+                        "Source": "football-data.org",
+                    }
+                )
+        except Exception:
+            continue
+
+    if not rows:
+        raise RuntimeError("Ingen historik hämtades från football-data.org.")
+
+    new_df = pd.DataFrame(rows).drop_duplicates()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_file.exists():
+        old_df = pd.read_csv(out_file, low_memory=False)
+        merged = pd.concat([old_df, new_df], ignore_index=True).drop_duplicates(
+            subset=["Date", "HomeTeam", "AwayTeam", "Competition"]
+        )
+    else:
+        merged = new_df
+    merged = merged.sort_values(["Date", "Competition", "HomeTeam"], ascending=True)
+    merged.to_csv(out_file, index=False)
+    return merged
 
 
 def download_upcoming_coupon(out_file: Path, n_matches: int = 13) -> pd.DataFrame:
@@ -162,7 +258,7 @@ def _extract_json_assignment(html: str, variable_name: str) -> dict:
     raise RuntimeError(f"Kunde inte extrahera JSON för {variable_name}.")
 
 
-def download_official_coupon_from_svenskaspel(out_file: Path) -> pd.DataFrame:
+def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
     url = "https://spela.svenskaspel.se/europatipset/statistik"
     response = requests.get(url, timeout=30)
     response.raise_for_status()
@@ -229,6 +325,69 @@ def download_official_coupon_from_svenskaspel(out_file: Path) -> pd.DataFrame:
     if len(out) < 13:
         raise RuntimeError(f"Hittade bara {len(out)} matcher med odds i officiell kupong.")
 
+    meta = {
+        "draw_number": str(draw.get("drawNumber", "")),
+        "draw_comment": str(draw.get("drawComment", "")),
+        "reg_close_time": str(draw.get("regCloseTime", "")),
+        "reg_close_description": str(draw.get("regCloseDescription", "")),
+        "current_net_sale": str(draw.get("currentNetSale", "")),
+        "row_price": str(draw.get("rowPrice", "")),
+    }
+    return out, meta
+
+
+def auto_refresh_official_snapshot(
+    out_coupon_csv: Path,
+    out_meta_json: Path,
+    hours_before_close: int = 2,
+    min_interval_minutes: int = 15,
+) -> Tuple[bool, str]:
+    """
+    Refresh official coupon/meta only when we are close to stop time.
+    Returns (did_refresh, message).
+    """
+    coupon_df, meta = fetch_official_coupon_state()
+    close_raw = meta.get("reg_close_time", "")
+    if not close_raw:
+        return False, "Kunde inte avgöra spelstoppstid."
+
+    close_dt = pd.to_datetime(close_raw, utc=True, errors="coerce")
+    if pd.isna(close_dt):
+        return False, "Ogiltig spelstoppstid."
+
+    now_utc = pd.Timestamp.now("UTC")
+    hours_left = (close_dt - now_utc).total_seconds() / 3600.0
+    if hours_left > float(hours_before_close):
+        return False, f"För tidigt för refresh ({hours_left:.2f}h kvar till spelstopp)."
+    if hours_left < -1:
+        return False, "Omgången verkar ha stängt."
+
+    if out_meta_json.exists():
+        try:
+            old = json.loads(out_meta_json.read_text(encoding="utf-8"))
+            last_refresh = pd.to_datetime(old.get("last_refresh_utc"), utc=True, errors="coerce")
+            if pd.notna(last_refresh):
+                mins_since = (now_utc - last_refresh).total_seconds() / 60.0
+                if mins_since < float(min_interval_minutes):
+                    return False, f"Refresh nyligen gjord ({mins_since:.1f} min sedan)."
+        except Exception:
+            pass
+
+    out_coupon_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_meta_json.parent.mkdir(parents=True, exist_ok=True)
+    coupon_df.to_csv(out_coupon_csv, index=False)
+    meta_out = {
+        **meta,
+        "last_refresh_utc": now_utc.isoformat(),
+        "hours_before_close_window": hours_before_close,
+        "min_interval_minutes": min_interval_minutes,
+    }
+    out_meta_json.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
+    return True, "Refresh genomförd."
+
+
+def download_official_coupon_from_svenskaspel(out_file: Path) -> pd.DataFrame:
+    out, _ = fetch_official_coupon_state()
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_file, index=False)
     return out
@@ -299,6 +458,39 @@ class MatchSuggestion:
     selection: str
 
 
+def validate_coupon_data(df: pd.DataFrame) -> List[str]:
+    warnings: List[str] = []
+    required = {"Match", "Odd1", "OddX", "Odd2"}
+    missing = required - set(df.columns)
+    if missing:
+        warnings.append(f"Saknar kolumner: {', '.join(sorted(missing))}")
+        return warnings
+
+    odd_cols = ["Odd1", "OddX", "Odd2"]
+    for col in odd_cols:
+        if (pd.to_numeric(df[col], errors="coerce") <= 1.01).any():
+            warnings.append(f"Upptäckte orimliga odds i {col} (<= 1.01).")
+        if pd.to_numeric(df[col], errors="coerce").isna().any():
+            warnings.append(f"Upptäckte saknade/ogiltiga odds i {col}.")
+
+    streck_cols = ["Streck1", "StreckX", "Streck2"]
+    if all(c in df.columns for c in streck_cols):
+        streck = df[streck_cols].copy()
+        for c in streck_cols:
+            if streck[c].max() > 1.5:
+                streck[c] = streck[c] / 100.0
+        sums = streck.sum(axis=1)
+        if ((sums < 0.97) | (sums > 1.03)).any():
+            warnings.append("Streck 1/X/2 summerar inte nära 100% på vissa matcher.")
+    else:
+        warnings.append("Streckkolumner saknas; default 33.33% används.")
+
+    if df["Match"].duplicated().any():
+        warnings.append("Duplicerade matcher upptäckta i kupongen.")
+
+    return warnings
+
+
 def parse_coupon(coupon_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(coupon_csv)
     required = {"Match", "Odd1", "OddX", "Odd2"}
@@ -317,6 +509,16 @@ def parse_coupon(coupon_csv: Path) -> pd.DataFrame:
     return df
 
 
+def enforce_game_type(df: pd.DataFrame, game_type: str = "europatipset") -> pd.DataFrame:
+    cfg = GAME_TYPES.get(game_type)
+    if not cfg:
+        raise ValueError(f"Okänd omgångstyp: {game_type}")
+    needed = int(cfg["match_count"])
+    if len(df) < needed:
+        raise ValueError(f"{game_type} kräver {needed} matcher, men kupongen har {len(df)}.")
+    return df.head(needed).copy()
+
+
 def calibrated_probs(model, odd1: float, oddx: float, odd2: float) -> Tuple[float, float, float]:
     inv = np.array([1 / odd1, 1 / oddx, 1 / odd2], dtype=float)
     p_raw = inv / inv.sum()
@@ -325,7 +527,11 @@ def calibrated_probs(model, odd1: float, oddx: float, odd2: float) -> Tuple[floa
     return float(p[0]), float(p[1]), float(p[2])
 
 
-def optimize_system(matches: List[MatchSuggestion], max_rows: int) -> Tuple[List[str], int]:
+def optimize_system(
+    matches: List[MatchSuggestion],
+    max_rows: int,
+    strategy: str = "balanced",
+) -> Tuple[List[str], int]:
     options = ["1", "X", "2"]
     probs = [np.array([m.p1, m.px, m.p2]) for m in matches]
     order = [list(np.argsort(-p)) for p in probs]
@@ -339,7 +545,22 @@ def optimize_system(matches: List[MatchSuggestion], max_rows: int) -> Tuple[List
 
     def score(state: List[List[int]]) -> float:
         # Proxy for chance to have at least one winning row.
-        return float(sum(math.log(max(1e-9, cover(i, state[i]))) for i in range(len(state))))
+        base = float(sum(math.log(max(1e-9, cover(i, state[i]))) for i in range(len(state))))
+        if strategy == "safe":
+            # Bias slightly toward favorites (higher max sign probability per match).
+            safe_bonus = float(
+                sum(max(probs[i][state[i]]) for i in range(len(state))) / max(1, len(state))
+            )
+            return base + 0.90 * safe_bonus
+        if strategy == "value":
+            # Bias slightly toward wider coverage in uncertain matches.
+            width_bonus = float(sum(len(state[i]) for i in range(len(state))) / max(1, len(state)))
+            entropy_bonus = float(
+                sum((-np.sum(probs[i] * np.log(np.clip(probs[i], 1e-9, 1.0)))) * len(state[i]) for i in range(len(state)))
+                / max(1, len(state))
+            )
+            return base + 0.28 * width_bonus + 0.12 * entropy_bonus
+        return base
 
     while True:
         best_delta = None
@@ -383,11 +604,102 @@ def optimize_system(matches: List[MatchSuggestion], max_rows: int) -> Tuple[List
     return picks, rows
 
 
-def suggest_system(coupon_csv: Path, model_file: Path, max_rows: int, out_csv: Path) -> pd.DataFrame:
+def expand_system_rows(picks: List[str], max_expand_rows: int = 10000) -> np.ndarray:
+    sign_to_int = {"1": 0, "X": 1, "2": 2}
+    rows: List[List[int]] = [[]]
+    for p in picks:
+        options = [sign_to_int[s] for s in p]
+        rows = [r + [o] for r in rows for o in options]
+        if len(rows) > max_expand_rows:
+            rows = rows[:max_expand_rows]
+            break
+    return np.array(rows, dtype=np.int8)
+
+
+def simulate_rights_distribution(
+    result_df: pd.DataFrame,
+    n_sim: int = 20000,
+    seed: int = 42,
+) -> Dict:
+    picks = result_df["Förslag"].tolist()
+    row_matrix = expand_system_rows(picks)
+    if len(row_matrix) == 0:
+        return {}
+
+    probs = result_df[["P1", "PX", "P2"]].to_numpy(dtype=float)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    n_matches = probs.shape[0]
+    rng = np.random.default_rng(seed)
+
+    outcomes = np.zeros((n_sim, n_matches), dtype=np.int8)
+    for i in range(n_matches):
+        outcomes[:, i] = rng.choice([0, 1, 2], size=n_sim, p=probs[i])
+
+    max_hits = np.zeros(n_sim, dtype=np.int16)
+    for i in range(n_sim):
+        hits = (row_matrix == outcomes[i]).sum(axis=1)
+        max_hits[i] = hits.max()
+
+    dist = {k: float((max_hits == k).mean()) for k in sorted(set(max_hits.tolist()))}
+    dist["most_likely"] = int(Counter(max_hits.tolist()).most_common(1)[0][0])
+    return dist
+
+
+def assess_forecast_confidence(result_df: pd.DataFrame) -> Dict[str, float | str]:
+    probs = result_df[["P1", "PX", "P2"]].to_numpy(dtype=float)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    entropy = -np.sum(probs * np.log(np.clip(probs, 1e-9, 1.0)), axis=1)
+    max_entropy = math.log(3.0)
+    normalized_uncertainty = float(np.mean(entropy / max_entropy))
+    sorted_probs = np.sort(probs, axis=1)
+    avg_top_gap = float(np.mean(sorted_probs[:, 2] - sorted_probs[:, 1]))
+
+    # Entropy tends to be high in 1X2 markets; use a more practical calibration.
+    if normalized_uncertainty < 0.88 and avg_top_gap > 0.18:
+        label = "Hög"
+    elif normalized_uncertainty < 0.96 and avg_top_gap > 0.10:
+        label = "Medel"
+    else:
+        label = "Låg"
+    return {
+        "confidence_label": label,
+        "uncertainty_score": normalized_uncertainty,
+        "avg_top_gap": avg_top_gap,
+    }
+
+
+def recommend_max_stake(
+    forecast_dist: Dict,
+    payout_by_rights: Dict[int, float],
+    margin_pct: float = 15.0,
+    bankroll_cap: float = 0.0,
+) -> Dict[str, float]:
+    expected_gross = 0.0
+    for k, payout in payout_by_rights.items():
+        expected_gross += float(forecast_dist.get(k, 0.0)) * float(payout)
+    max_break_even = max(0.0, expected_gross)
+    max_conservative = max_break_even * (1 - margin_pct / 100.0)
+    recommended = min(max_conservative, bankroll_cap) if bankroll_cap > 0 else max_conservative
+    return {
+        "expected_gross": expected_gross,
+        "max_break_even": max_break_even,
+        "max_conservative": max_conservative,
+        "recommended_max": recommended,
+    }
+
+
+def suggest_system(
+    coupon_csv: Path,
+    model_file: Path,
+    max_rows: int,
+    out_csv: Path,
+    strategy: str = "balanced",
+    game_type: str = "europatipset",
+) -> pd.DataFrame:
     with open(model_file, "rb") as f:
         model = pickle.load(f)
 
-    coupon = parse_coupon(coupon_csv)
+    coupon = enforce_game_type(parse_coupon(coupon_csv), game_type=game_type)
     matches: List[MatchSuggestion] = []
 
     for _, row in coupon.iterrows():
@@ -407,7 +719,7 @@ def suggest_system(coupon_csv: Path, model_file: Path, max_rows: int, out_csv: P
         )
         matches.append(m)
 
-    picks, rows = optimize_system(matches, max_rows=max_rows)
+    picks, rows = optimize_system(matches, max_rows=max_rows, strategy=strategy)
 
     out = coupon.copy()
     out["P1"] = [m.p1 for m in matches]
@@ -418,10 +730,112 @@ def suggest_system(coupon_csv: Path, model_file: Path, max_rows: int, out_csv: P
     out["Value2"] = out["P2"] - out["Streck2"]
     out["Förslag"] = picks
     out["Systemrader"] = rows
+    out["Strategi"] = strategy
+    out["GameType"] = game_type
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_csv, index=False)
     return out
+
+
+def backtest_strategies(
+    history_csv: Path,
+    model_file: Path,
+    budgets: List[int],
+    strategies: List[str],
+    game_type: str = "europatipset",
+    n_coupons: int = 50,
+    seed: int = 7,
+) -> pd.DataFrame:
+    df = pd.read_csv(history_csv, low_memory=False)
+    train = prepare_training_frame(df)
+    rng = np.random.default_rng(seed)
+    match_count = GAME_TYPES[game_type]["match_count"]
+    row_price = GAME_TYPES[game_type]["row_price"]
+
+    with open(model_file, "rb") as f:
+        model = pickle.load(f)
+
+    samples = train.sample(n=min(len(train), max(match_count * n_coupons, match_count)), random_state=seed).reset_index(drop=True)
+    chunks = [samples.iloc[i : i + match_count] for i in range(0, len(samples), match_count)]
+    chunks = [c for c in chunks if len(c) == match_count][:n_coupons]
+    if not chunks:
+        raise RuntimeError("För lite historik för backtest.")
+
+    results = []
+    for budget in budgets:
+        for strategy in strategies:
+            total_cost = 0.0
+            total_return = 0.0
+            rights_counter: Counter = Counter()
+
+            for chunk in chunks:
+                coupon = pd.DataFrame(
+                    {
+                        "Match": [f"M{i+1}" for i in range(match_count)],
+                        "Odd1": chunk["odd1"].to_numpy(),
+                        "OddX": chunk["oddx"].to_numpy(),
+                        "Odd2": chunk["odd2"].to_numpy(),
+                    }
+                )
+                inv = 1 / coupon[["Odd1", "OddX", "Odd2"]].to_numpy()
+                p = inv / inv.sum(axis=1, keepdims=True)
+                noisy = np.clip(p + rng.normal(0, 0.04, size=p.shape), 0.01, 0.98)
+                noisy = noisy / noisy.sum(axis=1, keepdims=True)
+                coupon["Streck1"] = noisy[:, 0]
+                coupon["StreckX"] = noisy[:, 1]
+                coupon["Streck2"] = noisy[:, 2]
+
+                tmp_coupon = history_csv.parent / "_tmp_backtest_coupon.csv"
+                tmp_out = history_csv.parent / "_tmp_backtest_out.csv"
+                coupon.to_csv(tmp_coupon, index=False)
+                out = suggest_system(
+                    coupon_csv=tmp_coupon,
+                    model_file=model_file,
+                    max_rows=int(budget),
+                    out_csv=tmp_out,
+                    strategy=strategy,
+                    game_type=game_type,
+                )
+
+                picks = out["Förslag"].tolist()
+                rows_matrix = expand_system_rows(picks)
+                actual = chunk["y"].to_numpy(dtype=int)
+                hits = (rows_matrix == actual).sum(axis=1)
+                max_hit = int(hits.max())
+                rights_counter[max_hit] += 1
+
+                # More realistic payout: depends on upset level and total pool.
+                # Higher upset level -> fewer winners -> higher payout.
+                base_pool = float(budget) * 1500.0
+                upset_level = float(np.mean(1.0 - noisy[np.arange(match_count), actual]))
+                payout_map = {
+                    10: base_pool * 0.02 * (1 + upset_level * 1.2),
+                    11: base_pool * 0.09 * (1 + upset_level * 1.8),
+                    12: base_pool * 0.25 * (1 + upset_level * 2.4),
+                    13: base_pool * 0.64 * (1 + upset_level * 3.2),
+                }
+                payout = payout_map.get(max_hit, 0.0)
+                rows = int(out["Systemrader"].iloc[0])
+                cost = rows * row_price
+                total_cost += cost
+                total_return += payout
+
+            roi = (total_return - total_cost) / total_cost if total_cost > 0 else 0.0
+            results.append(
+                {
+                    "GameType": game_type,
+                    "Strategy": strategy,
+                    "BudgetRows": int(budget),
+                    "CouponsTested": len(chunks),
+                    "ROI": roi,
+                    "AvgReturnPerCoupon": total_return / max(1, len(chunks)),
+                    "Hit10PlusRate": sum(v for k, v in rights_counter.items() if k >= 10) / max(1, len(chunks)),
+                    "Hit12PlusRate": sum(v for k, v in rights_counter.items() if k >= 12) / max(1, len(chunks)),
+                }
+            )
+
+    return pd.DataFrame(results).sort_values(["ROI", "Hit12PlusRate"], ascending=False)
 
 
 def main():
@@ -432,6 +846,10 @@ def main():
     d.add_argument("--out", default="data/raw/history.csv")
     d.add_argument("--years", type=int, default=6)
 
+    fa = sub.add_parser("sync-free-api-history", help="Synka historik från gratis football-data.org API")
+    fa.add_argument("--out", default="data/raw/history_api.csv")
+    fa.add_argument("--days-back", type=int, default=120)
+
     t = sub.add_parser("train", help="Träna sannolikhetsmodell")
     t.add_argument("--history", default="data/raw/history.csv")
     t.add_argument("--model", default="data/models/calibration.pkl")
@@ -441,6 +859,8 @@ def main():
     r.add_argument("--model", default="data/models/calibration.pkl")
     r.add_argument("--max-rows", type=int, default=64)
     r.add_argument("--out", default="data/output/recommendation.csv")
+    r.add_argument("--strategy", choices=["balanced", "safe", "value"], default="balanced")
+    r.add_argument("--game-type", choices=list(GAME_TYPES.keys()), default="europatipset")
 
     c = sub.add_parser("build-coupon", help="Bygg kupong automatiskt från kommande matcher")
     c.add_argument("--out", default="data/input/auto_coupon.csv")
@@ -449,16 +869,41 @@ def main():
     o = sub.add_parser("build-official-coupon", help="Bygg kupong från Svenska Spel statistik")
     o.add_argument("--out", default="data/input/official_coupon.csv")
 
+    ar = sub.add_parser("auto-refresh-official", help="Auto-refresh nära spelstopp för omsättning/kupong")
+    ar.add_argument("--coupon-out", default="data/input/official_coupon.csv")
+    ar.add_argument("--meta-out", default="data/input/official_meta.json")
+    ar.add_argument("--hours-before-close", type=int, default=2)
+    ar.add_argument("--min-interval-minutes", type=int, default=15)
+
+    bt = sub.add_parser("backtest", help="Kör historiskt backtest för strategier/budgetar")
+    bt.add_argument("--history", default="data/raw/history.csv")
+    bt.add_argument("--model", default="data/models/calibration.pkl")
+    bt.add_argument("--out", default="data/output/backtest.csv")
+    bt.add_argument("--budgets", default="32,64,128")
+    bt.add_argument("--strategies", default="balanced,safe,value")
+    bt.add_argument("--game-type", choices=list(GAME_TYPES.keys()), default="europatipset")
+    bt.add_argument("--n-coupons", type=int, default=50)
+
     args = parser.parse_args()
 
     if args.cmd == "download":
         df = download_historical_data(Path(args.out), back_years=args.years)
         print(f"Nedladdat: {len(df)} matcher -> {args.out}")
+    elif args.cmd == "sync-free-api-history":
+        df = sync_history_from_free_api(Path(args.out), days_back=args.days_back)
+        print(f"API-historik synkad: {len(df)} matcher totalt -> {args.out}")
     elif args.cmd == "train":
         train_model(Path(args.history), Path(args.model))
         print(f"Modell sparad: {args.model}")
     elif args.cmd == "recommend":
-        out = suggest_system(Path(args.coupon), Path(args.model), args.max_rows, Path(args.out))
+        out = suggest_system(
+            Path(args.coupon),
+            Path(args.model),
+            args.max_rows,
+            Path(args.out),
+            strategy=args.strategy,
+            game_type=args.game_type,
+        )
         print(f"Förslag sparat: {args.out}")
         print(out[["Match", "Förslag", "P1", "PX", "P2", "Value1", "ValueX", "Value2"]].to_string(index=False))
     elif args.cmd == "build-coupon":
@@ -468,6 +913,29 @@ def main():
     elif args.cmd == "build-official-coupon":
         out = download_official_coupon_from_svenskaspel(Path(args.out))
         print(f"Officiell kupong skapad: {args.out}")
+        print(out.to_string(index=False))
+    elif args.cmd == "auto-refresh-official":
+        changed, message = auto_refresh_official_snapshot(
+            out_coupon_csv=Path(args.coupon_out),
+            out_meta_json=Path(args.meta_out),
+            hours_before_close=args.hours_before_close,
+            min_interval_minutes=args.min_interval_minutes,
+        )
+        print(f"Auto-refresh: {'JA' if changed else 'NEJ'} - {message}")
+    elif args.cmd == "backtest":
+        budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
+        strategies = [x.strip() for x in args.strategies.split(",") if x.strip()]
+        out = backtest_strategies(
+            history_csv=Path(args.history),
+            model_file=Path(args.model),
+            budgets=budgets,
+            strategies=strategies,
+            game_type=args.game_type,
+            n_coupons=args.n_coupons,
+        )
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(args.out, index=False)
+        print(f"Backtest sparat: {args.out}")
         print(out.to_string(index=False))
 
 

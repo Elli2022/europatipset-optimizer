@@ -1,0 +1,581 @@
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import streamlit as st
+
+from europatipset import (
+    GAME_TYPES,
+    assess_forecast_confidence,
+    auto_refresh_official_snapshot,
+    backtest_strategies,
+    fetch_official_coupon_state,
+    recommend_max_stake,
+    simulate_rights_distribution,
+    suggest_system,
+    sync_history_from_free_api,
+    validate_coupon_data,
+)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+INPUT_DIR = DATA_DIR / "input"
+OUTPUT_DIR = DATA_DIR / "output"
+MODEL_PATH = DATA_DIR / "models" / "calibration.pkl"
+OFFICIAL_COUPON_PATH = INPUT_DIR / "official_coupon.csv"
+RECOMMENDATION_PATH = OUTPUT_DIR / "recommendation_official.csv"
+API_HISTORY_PATH = DATA_DIR / "raw" / "history_api.csv"
+OFFICIAL_META_PATH = INPUT_DIR / "official_meta.json"
+
+WEEKDAYS_SV = {
+    0: "Måndag",
+    1: "Tisdag",
+    2: "Onsdag",
+    3: "Torsdag",
+    4: "Fredag",
+    5: "Lördag",
+    6: "Söndag",
+}
+
+
+def _parse_swe_number(value: str | float | int | None, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(" ", "").replace("\xa0", "")
+    # Handle "502836,00" style numbers.
+    text = text.replace(".", "").replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return default
+
+
+def _format_draw_meta(meta: dict) -> tuple[str, str]:
+    close_raw = meta.get("reg_close_time", "")
+    try:
+        close_dt = datetime.fromisoformat(close_raw)
+        close_dt = close_dt.astimezone(ZoneInfo("Europe/Stockholm"))
+        week = close_dt.isocalendar().week
+        weekday = WEEKDAYS_SV[close_dt.weekday()]
+        date_sv = close_dt.strftime("%Y-%m-%d")
+        header = f"Vecka {week} - {weekday} {date_sv}"
+        details = f"Omgång: {meta.get('draw_comment', '-')}, spelstopp: {close_dt.strftime('%Y-%m-%d %H:%M')}"
+        return header, details
+    except Exception:
+        return "Vecka/datum saknas", f"Omgång: {meta.get('draw_comment', '-')}"
+
+
+def _run_recommendation(max_rows: int) -> pd.DataFrame:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return suggest_system(
+        coupon_csv=OFFICIAL_COUPON_PATH,
+        model_file=MODEL_PATH,
+        max_rows=max_rows,
+        out_csv=RECOMMENDATION_PATH,
+        strategy=st.session_state.get("strategy", "balanced"),
+        game_type=st.session_state.get("game_type", "europatipset"),
+    )
+
+
+def _history_status(path: Path) -> tuple[str, str]:
+    if not path.exists():
+        return "Ingen API-historik synkad ännu.", "Klicka 'Synka API-historik nu' i sidpanelen."
+    df = pd.read_csv(path, low_memory=False)
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=ZoneInfo("Europe/Stockholm"))
+    return (
+        f"{len(df)} matcher i API-historik",
+        f"Senast synkad: {mtime.strftime('%Y-%m-%d %H:%M:%S')}",
+    )
+
+
+def _hours_to_close(meta: dict) -> float | None:
+    close_raw = meta.get("reg_close_time", "")
+    if not close_raw:
+        return None
+    try:
+        close_dt = pd.to_datetime(close_raw, utc=True, errors="coerce")
+        if pd.isna(close_dt):
+            return None
+        now_utc = pd.Timestamp.now("UTC")
+        return float((close_dt - now_utc).total_seconds() / 3600.0)
+    except Exception:
+        return None
+
+
+def _last_hour_warning(meta: dict) -> None:
+    hours_left = _hours_to_close(meta)
+    if hours_left is None:
+        return
+    if hours_left <= 0:
+        st.error("Spelstopp verkar ha passerat för aktuell omgång.")
+        return
+    minutes_left = int(hours_left * 60)
+    if minutes_left <= 15:
+        st.markdown(
+            f"""
+            <div style="background:#b91c1c;color:white;padding:14px 16px;border-radius:10px;
+                        font-weight:700;font-size:1.1rem;text-align:center;margin:8px 0 12px 0;">
+                LAGG SPEL NU - {minutes_left} minuter kvar till spelstopp
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    if hours_left <= 1:
+        st.warning(
+            f"Sista timmen: {minutes_left} minuter kvar till spelstopp. "
+            "Uppdatera kupong och lägg spel nu för senast möjliga beslut."
+        )
+    elif hours_left <= 2:
+        st.info(f"{minutes_left} minuter kvar till spelstopp. Förbered sista uppdatering.")
+
+
+def _load_cached_meta() -> dict:
+    if not OFFICIAL_META_PATH.exists():
+        return {}
+    try:
+        return json.loads(OFFICIAL_META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _risk_level(confidence_label: str, warning_count: int) -> tuple[str, str, str]:
+    """
+    Returns (label, color, reason)
+    """
+    if confidence_label == "Hög" and warning_count == 0:
+        return ("GRON", "#16a34a", "Hög konfidens och inga datavarningar.")
+    if confidence_label == "Låg" or warning_count >= 2:
+        return ("ROD", "#b91c1c", "Låg konfidens eller flera datavarningar.")
+    return ("GUL", "#ca8a04", "Viss osäkerhet - spela mer försiktigt.")
+
+
+st.set_page_config(page_title="Europatipset Optimizer", page_icon="⚽", layout="wide")
+st.title("Europatipset Optimizer")
+st.caption("Användarvänligt stöd för att välja tecken med sannolikhet, streckvärde och scenarios.")
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1rem; padding-bottom: 1rem;}
+      @media (max-width: 768px) {
+        .block-container {padding-left: 0.7rem; padding-right: 0.7rem;}
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.header("Inställningar")
+    view_mode = st.selectbox(
+        "Visningsläge",
+        options=["Desktop (tabell)", "Mobil (kort)"],
+        index=0,
+    )
+    mobile_mode = view_mode == "Mobil (kort)"
+    st.session_state["game_type"] = st.selectbox(
+        "Omgångstyp",
+        options=list(GAME_TYPES.keys()),
+        format_func=lambda x: f"{x} ({GAME_TYPES[x]['match_count']} matcher)",
+    )
+    max_rows = st.number_input("Max antal rader", min_value=1, max_value=4096, value=64, step=1)
+    st.session_state["strategy"] = st.selectbox(
+        "Strategi",
+        options=["balanced", "safe", "value"],
+        format_func=lambda x: {
+            "balanced": "Balanserad",
+            "safe": "Säker (favorit-fokus)",
+            "value": "Värde (mer gardering)",
+        }[x],
+    )
+    compare_budgets = st.multiselect(
+        "Jämför budgetscenarier",
+        options=[16, 32, 64, 128, 256, 512],
+        default=[32, 64, 128],
+    )
+    days_back = st.slider("API-historik (dagar bakåt)", min_value=30, max_value=365, value=120, step=10)
+    auto_turnover_refresh = st.toggle("Auto-hämta omsättning från Svenska Spel", value=True)
+    if st.button("Synka API-historik nu", use_container_width=True):
+        if not os.getenv("FOOTBALL_DATA_API_KEY"):
+            st.error("Saknar FOOTBALL_DATA_API_KEY. Lägg till i miljövariabler/Streamlit Secrets.")
+        else:
+            with st.spinner("Synkar historik från football-data.org..."):
+                try:
+                    df_api = sync_history_from_free_api(API_HISTORY_PATH, days_back=days_back)
+                    st.success(f"API-historik synkad: {len(df_api)} matcher totalt.")
+                except Exception as exc:
+                    st.error(f"Kunde inte synka API-historik: {exc}")
+
+status_line, status_detail = _history_status(API_HISTORY_PATH)
+st.info(f"{status_line}  |  {status_detail}")
+cached_meta = _load_cached_meta()
+if auto_turnover_refresh:
+    try:
+        # Try often, but the refresh function throttles writes and avoids excess calls.
+        did_refresh, _ = auto_refresh_official_snapshot(
+            out_coupon_csv=OFFICIAL_COUPON_PATH,
+            out_meta_json=OFFICIAL_META_PATH,
+            hours_before_close=24,
+            min_interval_minutes=15,
+        )
+        if did_refresh:
+            cached_meta = _load_cached_meta()
+    except Exception:
+        pass
+
+if cached_meta:
+    _last_hour_warning(cached_meta)
+
+st.write("1) Hämta officiell kupong  2) Välj strategi/budget  3) Analysera och exportera")
+
+if "coupon_df" not in st.session_state:
+    st.session_state["coupon_df"] = None
+if "result_df" not in st.session_state:
+    st.session_state["result_df"] = None
+if "meta" not in st.session_state:
+    st.session_state["meta"] = {}
+if "backtest_df" not in st.session_state:
+    st.session_state["backtest_df"] = None
+
+if st.button("Hämta officiell kupong och beräkna förslag", type="primary", use_container_width=True):
+    if not MODEL_PATH.exists():
+        st.error("Modell saknas. Kör först: python europatipset.py train --history data/raw/history.csv --model data/models/calibration.pkl")
+    else:
+        with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
+            try:
+                coupon_df, meta = fetch_official_coupon_state()
+                INPUT_DIR.mkdir(parents=True, exist_ok=True)
+                coupon_df.to_csv(OFFICIAL_COUPON_PATH, index=False)
+                result_df = _run_recommendation(max_rows=max_rows)
+                st.session_state["coupon_df"] = coupon_df
+                st.session_state["result_df"] = result_df
+                st.session_state["meta"] = meta
+                st.session_state["forecast_dist"] = None
+            except Exception as exc:
+                st.error(f"Kunde inte hämta eller beräkna kupong: {exc}")
+
+if st.session_state["result_df"] is not None and st.session_state["coupon_df"] is not None:
+    try:
+                coupon_df = st.session_state["coupon_df"]
+                result_df = st.session_state["result_df"]
+                meta = st.session_state.get("meta") or {}
+                header, details = _format_draw_meta(meta)
+                st.success("Klart!")
+                st.subheader(header)
+                st.write(details)
+                st.caption(f"Senast uppdaterad: {datetime.now(ZoneInfo('Europe/Stockholm')).strftime('%Y-%m-%d %H:%M:%S')}")
+                _last_hour_warning(meta)
+
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+                    [
+                        "Systemförslag",
+                        "Matchanalys",
+                        "Budgetjämförelse",
+                        "Träffprognos",
+                        "Utdelningskalkyl",
+                        "Data & export",
+                        "Backtest",
+                    ]
+                )
+
+                data_warnings = validate_coupon_data(coupon_df)
+                confidence = assess_forecast_confidence(result_df)
+                if data_warnings:
+                    st.warning("Datakvalitetsflaggor: " + " | ".join(data_warnings))
+                st.caption(
+                    f"Prognoskonfidens: {confidence['confidence_label']} "
+                    f"(osäkerhet={confidence['uncertainty_score']:.2f}, topp-gap={confidence['avg_top_gap']:.2f})"
+                )
+                risk_label, risk_color, risk_reason = _risk_level(
+                    confidence_label=str(confidence["confidence_label"]),
+                    warning_count=len(data_warnings),
+                )
+                st.markdown(
+                    f"""
+                    <div style="background:{risk_color};color:white;padding:10px 14px;border-radius:10px;
+                                font-weight:700;text-align:center;margin:6px 0 10px 0;">
+                        Trafikljus: {risk_label}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Orsak: {risk_reason}")
+
+                with tab1:
+                    show_cols = ["Match", "Förslag", "P1", "PX", "P2", "Value1", "ValueX", "Value2"]
+                    formatted = result_df[show_cols].copy()
+                    for c in ["P1", "PX", "P2", "Value1", "ValueX", "Value2"]:
+                        formatted[c] = (formatted[c] * 100).map(lambda v: f"{v:.1f}%")
+                    if mobile_mode:
+                        for _, row in formatted.iterrows():
+                            st.markdown(f"**{row['Match']}**")
+                            c1, c2 = st.columns(2)
+                            c1.metric("Förslag", row["Förslag"])
+                            c2.metric("P1 / PX / P2", f"{row['P1']} / {row['PX']} / {row['P2']}")
+                            st.caption(
+                                f"Värde: 1={row['Value1']} | X={row['ValueX']} | 2={row['Value2']}"
+                            )
+                            st.divider()
+                    else:
+                        st.dataframe(formatted, use_container_width=True, hide_index=True)
+                    st.metric("Systemrader", int(result_df["Systemrader"].iloc[0]))
+                    st.caption(f"Strategi: {st.session_state.get('strategy', 'balanced')}")
+
+                with tab2:
+                    analysis = result_df.copy()
+                    analysis["Troligaste tecken"] = analysis[["P1", "PX", "P2"]].idxmax(axis=1).map(
+                        {"P1": "1", "PX": "X", "P2": "2"}
+                    )
+                    analysis["Bäst värde"] = analysis[["Value1", "ValueX", "Value2"]].idxmax(axis=1).map(
+                        {"Value1": "1", "ValueX": "X", "Value2": "2"}
+                    )
+                    analysis_view = analysis[
+                        ["Match", "Troligaste tecken", "Bäst värde", "Förslag", "P1", "PX", "P2"]
+                    ]
+                    if mobile_mode:
+                        for _, row in analysis_view.iterrows():
+                            with st.expander(row["Match"]):
+                                st.write(f"Troligaste tecken: **{row['Troligaste tecken']}**")
+                                st.write(f"Bäst värde: **{row['Bäst värde']}**")
+                                st.write(f"Förslag: **{row['Förslag']}**")
+                                st.write(
+                                    f"Sannolikhet 1/X/2: {row['P1']:.3f} / {row['PX']:.3f} / {row['P2']:.3f}"
+                                )
+                    else:
+                        st.dataframe(
+                            analysis_view,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                with tab3:
+                    scenarios = []
+                    for budget in compare_budgets:
+                        tmp_out = OUTPUT_DIR / f"scenario_{budget}.csv"
+                        df_budget = suggest_system(
+                            coupon_csv=OFFICIAL_COUPON_PATH,
+                            model_file=MODEL_PATH,
+                            max_rows=int(budget),
+                            out_csv=tmp_out,
+                            strategy=st.session_state.get("strategy", "balanced"),
+                            game_type=st.session_state.get("game_type", "europatipset"),
+                        )
+                        scenarios.append(
+                            {
+                                "Budget": int(budget),
+                                "Rader": int(df_budget["Systemrader"].iloc[0]),
+                                "Helgarderingar": int((df_budget["Förslag"].str.len() == 3).sum()),
+                                "Halvgarderingar": int((df_budget["Förslag"].str.len() == 2).sum()),
+                                "Spikar": int((df_budget["Förslag"].str.len() == 1).sum()),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(scenarios), use_container_width=True, hide_index=True)
+
+                with tab4:
+                    st.markdown("#### Sannolikhetsprognos för antal rätt")
+                    n_sim = st.slider("Antal simuleringar", min_value=5000, max_value=50000, value=20000, step=5000)
+                    if st.button("Beräkna prognos", key="run_prob_forecast"):
+                        with st.spinner("Simulerar utfallsfördelning..."):
+                            st.session_state["forecast_dist"] = simulate_rights_distribution(result_df, n_sim=n_sim)
+                    dist = st.session_state.get("forecast_dist")
+                    if dist:
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("10 rätt", f"{dist[10]*100:.1f}%")
+                        c2.metric("11 rätt", f"{dist[11]*100:.1f}%")
+                        c3.metric("12 rätt", f"{dist[12]*100:.1f}%")
+                        c4.metric("13 rätt", f"{dist[13]*100:.2f}%")
+                        c5.metric("Mest sannolikt", f"{dist['most_likely']} rätt")
+                        st.caption("Prognosen är Monte Carlo-baserad och beror på modellens sannolikheter.")
+
+                with tab5:
+                    st.markdown("#### Jämför vinst mot insats")
+                    meta_for_calc = meta if meta else cached_meta
+                    row_price = _parse_swe_number(meta_for_calc.get("row_price") or meta_for_calc.get("rowPrice"), default=1.0)
+                    net_sale = _parse_swe_number(
+                        meta_for_calc.get("current_net_sale") or meta_for_calc.get("currentNetSale"),
+                        default=0.0,
+                    )
+                    rows_count = int(result_df["Systemrader"].iloc[0])
+                    system_cost = rows_count * row_price
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        omsattning = st.number_input(
+                            "Omsättning (kr)",
+                            min_value=0.0,
+                            value=float(net_sale),
+                            step=1000.0,
+                        )
+                    with c2:
+                        aterbetalning = st.slider(
+                            "Återbetalning till vinstpool (%)",
+                            min_value=30,
+                            max_value=100,
+                            value=65,
+                            step=1,
+                        )
+                    with c3:
+                        st.metric("Systemkostnad", f"{system_cost:,.0f} kr".replace(",", " "))
+
+                    st.caption("Ange uppskattat antal vinnande rader per nivå för att räkna möjlig utdelning.")
+                    k1, k2, k3, k4 = st.columns(4)
+                    with k1:
+                        p13 = st.slider("Andel pott 13 rätt (%)", 0, 100, 40, 1)
+                        w13 = st.number_input("Vinnande rader 13 rätt", min_value=1, value=10, step=1)
+                    with k2:
+                        p12 = st.slider("Andel pott 12 rätt (%)", 0, 100, 20, 1)
+                        w12 = st.number_input("Vinnande rader 12 rätt", min_value=1, value=150, step=1)
+                    with k3:
+                        p11 = st.slider("Andel pott 11 rätt (%)", 0, 100, 20, 1)
+                        w11 = st.number_input("Vinnande rader 11 rätt", min_value=1, value=1200, step=1)
+                    with k4:
+                        p10 = st.slider("Andel pott 10 rätt (%)", 0, 100, 20, 1)
+                        w10 = st.number_input("Vinnande rader 10 rätt", min_value=1, value=7000, step=1)
+
+                    share_sum = p13 + p12 + p11 + p10
+                    if share_sum != 100:
+                        st.warning(f"Pottandelarna summerar till {share_sum}%. Justera till 100% för full fördelning.")
+
+                    prize_pool = omsattning * (aterbetalning / 100.0)
+                    pay13 = (prize_pool * (p13 / 100.0)) / max(1, w13)
+                    pay12 = (prize_pool * (p12 / 100.0)) / max(1, w12)
+                    pay11 = (prize_pool * (p11 / 100.0)) / max(1, w11)
+                    pay10 = (prize_pool * (p10 / 100.0)) / max(1, w10)
+
+                    out_df = pd.DataFrame(
+                        [
+                            {"Nivå": "13 rätt", "Uppskattad utdelning/rad (kr)": round(pay13)},
+                            {"Nivå": "12 rätt", "Uppskattad utdelning/rad (kr)": round(pay12)},
+                            {"Nivå": "11 rätt", "Uppskattad utdelning/rad (kr)": round(pay11)},
+                            {"Nivå": "10 rätt", "Uppskattad utdelning/rad (kr)": round(pay10)},
+                        ]
+                    )
+                    st.dataframe(out_df, use_container_width=True, hide_index=True)
+
+                    g1, g2, g3, g4 = st.columns(4)
+                    g1.metric("Netto vid 13 rätt", f"{(pay13 - system_cost):,.0f} kr".replace(",", " "))
+                    g2.metric("Netto vid 12 rätt", f"{(pay12 - system_cost):,.0f} kr".replace(",", " "))
+                    g3.metric("Netto vid 11 rätt", f"{(pay11 - system_cost):,.0f} kr".replace(",", " "))
+                    g4.metric("Netto vid 10 rätt", f"{(pay10 - system_cost):,.0f} kr".replace(",", " "))
+
+                    st.markdown("#### Rekommenderad maxinsats")
+                    forecast = st.session_state.get("forecast_dist")
+                    if not forecast:
+                        st.info("Kör först `Beräkna prognos` i fliken `Träffprognos` för att få maxinsats-rekommendation.")
+                    else:
+                        payout_model = {13: pay13, 12: pay12, 11: pay11, 10: pay10}
+                        margin = st.slider(
+                            "Säkerhetsmarginal för maxinsats (%)",
+                            min_value=0,
+                            max_value=50,
+                            value=15,
+                            step=1,
+                        )
+                        bankroll_cap = st.number_input(
+                            "Frivilligt eget tak (kr)",
+                            min_value=0.0,
+                            value=200.0,
+                            step=50.0,
+                        )
+                        rec = recommend_max_stake(
+                            forecast_dist=forecast,
+                            payout_by_rights=payout_model,
+                            margin_pct=float(margin),
+                            bankroll_cap=float(bankroll_cap),
+                        )
+
+                        r1, r2, r3 = st.columns(3)
+                        r1.metric("Break-even max (kr)", f"{rec['max_break_even']:,.0f}".replace(",", " "))
+                        r2.metric("Konservativ max (kr)", f"{rec['max_conservative']:,.0f}".replace(",", " "))
+                        r3.metric("Rekommenderad maxinsats (kr)", f"{rec['recommended_max']:,.0f}".replace(",", " "))
+                        st.caption(
+                            "Beräkningen baseras på simulerade sannolikheter (10-13 rätt) och din utdelningsmodell. "
+                            "Använd rekommenderad maxinsats som riskstyrning, inte garanti."
+                        )
+
+                with tab6:
+                    st.markdown("#### Officiell kupong")
+                    if mobile_mode:
+                        for _, row in coupon_df.iterrows():
+                            with st.expander(row["Match"]):
+                                st.write(f"Odds 1/X/2: {row['Odd1']} / {row['OddX']} / {row['Odd2']}")
+                                st.write(
+                                    f"Streck 1/X/2: {row['Streck1']} / {row['StreckX']} / {row['Streck2']}"
+                                )
+                    else:
+                        st.dataframe(coupon_df, use_container_width=True, hide_index=True)
+                    st.markdown("#### Redigerbar kupong (vad-om)")
+                    edited = st.data_editor(
+                        coupon_df,
+                        num_rows="fixed",
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    edited_path = INPUT_DIR / "official_coupon_edited.csv"
+                    pd.DataFrame(edited).to_csv(edited_path, index=False)
+                    st.caption(f"Redigerad kupong sparad: {edited_path}")
+                    st.caption(f"Rekommendation sparad i {RECOMMENDATION_PATH}")
+
+                with tab7:
+                    st.markdown("#### Historiskt backtest")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        bt_budgets = st.multiselect(
+                            "Budgetar (rader)",
+                            options=[16, 32, 64, 128, 256],
+                            default=[32, 64, 128],
+                        )
+                    with c2:
+                        bt_n = st.slider("Antal historiska kuponger", min_value=10, max_value=120, value=40, step=10)
+
+                    if st.button("Kör backtest", key="run_backtest"):
+                        with st.spinner("Kör backtest över historik..."):
+                            bt = backtest_strategies(
+                                history_csv=DATA_DIR / "raw" / "history.csv",
+                                model_file=MODEL_PATH,
+                                budgets=[int(x) for x in bt_budgets],
+                                strategies=["balanced", "safe", "value"],
+                                game_type=st.session_state.get("game_type", "europatipset"),
+                                n_coupons=int(bt_n),
+                            )
+                            st.session_state["backtest_df"] = bt
+                    if st.session_state.get("backtest_df") is not None:
+                        bt = st.session_state["backtest_df"]
+                        bt_numeric = bt.copy()
+                        # Simple combined score for budget recommendation.
+                        bt_numeric["Score"] = (bt_numeric["ROI"] * 0.65) + (bt_numeric["Hit12PlusRate"] * 0.35)
+                        best = bt_numeric.sort_values(["Score", "ROI"], ascending=False).iloc[0]
+                        st.success(
+                            f"Rekommenderad budget just nu: {int(best['BudgetRows'])} rader "
+                            f"med strategi `{best['Strategy']}` "
+                            f"(balans mellan avkastning och chans till 12+ rätt)."
+                        )
+                        st.caption(
+                            "Tolkning: högre budget ger ofta högre träffchans, men inte alltid bättre avkastning per krona."
+                        )
+
+                        chart_df = (
+                            bt_numeric.groupby("BudgetRows", as_index=False)
+                            .agg({"ROI": "mean", "Hit12PlusRate": "mean"})
+                            .sort_values("BudgetRows")
+                        )
+                        st.markdown("##### Chans vs kostnad")
+                        st.line_chart(
+                            chart_df.set_index("BudgetRows")[["ROI", "Hit12PlusRate"]],
+                            use_container_width=True,
+                        )
+
+                        bt_show = bt.copy()
+                        bt_show["ROI"] = (bt_show["ROI"] * 100).map(lambda v: f"{v:.1f}%")
+                        bt_show["Hit10PlusRate"] = (bt_show["Hit10PlusRate"] * 100).map(lambda v: f"{v:.1f}%")
+                        bt_show["Hit12PlusRate"] = (bt_show["Hit12PlusRate"] * 100).map(lambda v: f"{v:.1f}%")
+                        st.dataframe(bt_show, use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.error(f"Kunde inte visa resultat: {exc}")
+else:
+    st.info("Tryck på knappen för att hämta aktuell kupong och få förslag.")

@@ -1,4 +1,7 @@
-pandas
-numpy
-requests
-scikit-learn
+pandas==3.0.2
+numpy==2.4.4
+requests==2.33.1
+scikit-learn==1.8.0
+streamlit==1.57.0
+python-dotenv==1.1.1
+pytest==8.4.2

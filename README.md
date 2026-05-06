@@ -26,6 +26,45 @@ pip install -r requirements.txt
 python europatipset.py download --out data/raw/history.csv --years 6
 ```
 
+## 1b) Synka kontinuerlig historik från gratis API
+
+Vi använder `football-data.org` (gratisnivå). Skapa API-nyckel och sätt miljövariabel:
+
+```bash
+export FOOTBALL_DATA_API_KEY="din_nyckel"
+python europatipset.py sync-free-api-history --out data/raw/history_api.csv --days-back 120
+```
+
+Tips: kör detta dagligen/veckovis för kontinuerlig uppdatering.
+
+Exempel lokal dagskörning (cron):
+
+```bash
+chmod +x scripts/sync_history.sh
+crontab -e
+```
+
+Lägg till rad:
+
+```bash
+0 6 * * * /Users/elli/europatipset-optimizer/scripts/sync_history.sh >> /Users/elli/europatipset-optimizer/data/sync.log 2>&1
+```
+
+Auto-refresh inför spelstopp (uppdaterar omsättning/kupong nära spelstopp):
+
+```bash
+chmod +x scripts/refresh_before_stop.sh
+crontab -e
+```
+
+Lägg till rad (var 15:e minut):
+
+```bash
+*/15 * * * * /Users/elli/europatipset-optimizer/scripts/refresh_before_stop.sh >> /Users/elli/europatipset-optimizer/data/refresh.log 2>&1
+```
+
+Scriptet uppdaterar bara när det är nära spelstopp (default: inom 2 timmar).
+
 ## 2) Träna modell
 
 ```bash
@@ -41,6 +80,7 @@ python europatipset.py recommend \
   --coupon coupon_template.csv \
   --model data/models/calibration.pkl \
   --max-rows 64 \
+  --game-type europatipset \
   --out data/output/recommendation.csv
 ```
 
@@ -66,6 +106,53 @@ python europatipset.py recommend \
   --out data/output/recommendation_official.csv
 ```
 
+## Webb-UI (användarvänligt)
+
+Starta appen:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+I UI:t kan du:
+
+- hämta officiell kupong och streck med en knapp
+- välja radbudget och strategi (balanserad/säker/värde)
+- se systemförslag i tabell
+- jämföra flera budgetscenarier
+- göra manuell "vad-om"-redigering av kupong
+- synka gratis API-historik direkt i UI
+- se status för senaste historiksynk
+- se tydligt vilken vecka, veckodag och datum omgången gäller
+- räkna uppskattad utdelning/netto per rättnivå i utdelningskalkyl
+- se datakvalitetsvarningar för odds/streck
+- se prognoskonfidens (hög/medel/låg)
+- köra historiskt backtest (ROI + träffnivåer)
+- välja omgångstyp (`europatipset`/`topptipset`)
+
+## Deploy
+
+Se `DEPLOY_CHECKLIST.md` för snabb och stabil Streamlit Community Cloud-deploy.
+
+## Backtest via CLI
+
+```bash
+python europatipset.py backtest \
+  --history data/raw/history.csv \
+  --model data/models/calibration.pkl \
+  --out data/output/backtest.csv \
+  --budgets 32,64,128 \
+  --strategies balanced,safe,value \
+  --game-type europatipset \
+  --n-coupons 50
+```
+
+## Test
+
+```bash
+pytest
+```
+
 ## Kupongformat (CSV)
 
 Obligatoriska kolumner:
@@ -85,10 +172,10 @@ Valfria kolumner (streckfördelning):
 
 ## Begränsningar i MVP
 
-- Hämtar inte automatiskt veckans Europatipset-kupong från Svenska Spel (det varierar beroende på tillgänglighet och åtkomst).
 - `build-coupon` hämtar kommande matcher med odds från football-data.co.uk, inte exakt officiell Europatipset-kupong.
 - `build-official-coupon` läser officiell kupong, odds och streck från Svenska Spels statistik-sida.
 - Historiken kommer från europeiska ligor (football-data.co.uk), inte enbart Europatipset.
+- `sync-free-api-history` hämtar resultat-historik från football-data.org (gratis API), men innehåller inte bookmaker-odds.
 - Målet i optimeringen är bra sannolikhetstäckning under radbudget, inte direkt utdelningssimulering.
 
 ## Nästa steg
