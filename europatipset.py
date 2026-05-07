@@ -289,6 +289,15 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
         )
         if len(odds_values) != 3:
             odds_values = [None, None, None]
+        if any(v in [None, ""] for v in odds_values):
+            # After/near kickoff, current odds may be missing; fallback to opening odds.
+            start_odds = (
+                stat.get("startOdds", {})
+                .get("current", {})
+                .get("value", [None, None, None])
+            )
+            if len(start_odds) == 3 and not any(v in [None, ""] for v in start_odds):
+                odds_values = start_odds
 
         distributions = stat.get("distributions", {})
         dist_draw = distributions.get("2", {}).get(draw_number, {})
