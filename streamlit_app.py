@@ -60,6 +60,26 @@ def _bootstrap_calibration_model_if_missing(history_years: int = 3) -> tuple[boo
         return False, str(exc)
 
 
+def _ensure_backtest_history(history_years: int = 6) -> tuple[bool, str]:
+    """
+    Ensure history CSV exists and is parseable for backtests.
+    """
+    try:
+        if HISTORY_CSV.exists():
+            # Validate it's not empty/corrupt.
+            pd.read_csv(HISTORY_CSV, low_memory=False)
+            return True, ""
+    except Exception:
+        pass
+
+    try:
+        download_historical_data(HISTORY_CSV, back_years=history_years)
+        pd.read_csv(HISTORY_CSV, low_memory=False)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 WEEKDAYS_SV = {
     0: "Måndag",
     1: "Tisdag",
@@ -585,15 +605,19 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
 
                     if st.button("Kör backtest", key="run_backtest"):
                         with st.spinner("Kör backtest över historik..."):
-                            bt = backtest_strategies(
-                                history_csv=DATA_DIR / "raw" / "history.csv",
-                                model_file=MODEL_PATH,
-                                budgets=[int(x) for x in bt_budgets],
-                                strategies=["balanced", "safe", "value"],
-                                game_type=st.session_state.get("game_type", "europatipset"),
-                                n_coupons=int(bt_n),
-                            )
-                            st.session_state["backtest_df"] = bt
+                            ok_hist, hist_err = _ensure_backtest_history(history_years=6)
+                            if not ok_hist:
+                                st.error(f"Kunde inte förbereda backtest-historik: {hist_err}")
+                            else:
+                                bt = backtest_strategies(
+                                    history_csv=DATA_DIR / "raw" / "history.csv",
+                                    model_file=MODEL_PATH,
+                                    budgets=[int(x) for x in bt_budgets],
+                                    strategies=["balanced", "safe", "value"],
+                                    game_type=st.session_state.get("game_type", "europatipset"),
+                                    n_coupons=int(bt_n),
+                                )
+                                st.session_state["backtest_df"] = bt
                     if st.session_state.get("backtest_df") is not None:
                         bt = st.session_state["backtest_df"]
                         bt_numeric = bt.copy()

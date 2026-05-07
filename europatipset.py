@@ -756,6 +756,8 @@ def backtest_strategies(
     n_coupons: int = 50,
     seed: int = 7,
 ) -> pd.DataFrame:
+    if not history_csv.exists() or history_csv.stat().st_size == 0:
+        raise RuntimeError("Historikfil saknas eller är tom för backtest.")
     df = pd.read_csv(history_csv, low_memory=False)
     train = prepare_training_frame(df)
     rng = np.random.default_rng(seed)
