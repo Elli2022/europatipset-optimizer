@@ -598,9 +598,11 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         "\n\n"
                         "Här visas **ligatabell** (football-data.org free, cache ~12 h) och **form** "
                         "från din synkade **API-historik** när den finns. "
-                        "Det är **inte** skador eller officiella elvor — bara kontext som ofta korrelerar "
-                        "med styrkeförhållanden i de åtta gratisligorna (PL, La Liga, Serie A, … — "
-                        "se `free_context.py`). Kupongmatcher utanför dessa ligor lämnas tomma i tabellkolumnerna."
+                        "Extra kolumner (om de finns i kupongen): **odds- och streck-rörelser** från Svenska Spel, "
+                        "**StreckVol** (summa absolut streckförskjutning), samt **FormH/B_pts5** från lokala "
+                        "`data/raw/history*.csv` — de påverkar **P1/PX/P2** i systemförslaget lätt. "
+                        "Det är **inte** skador eller officiella elvor — bara kontext. "
+                        "Kupongmatcher utanför de åtta gratisligorna (se `free_context.py`) får ofta tomma tabellkolumner där."
                     )
                     analysis = result_df.copy()
                     analysis["Troligaste tecken"] = analysis[["P1", "PX", "P2"]].idxmax(axis=1).map(
@@ -609,8 +611,24 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                     analysis["Bäst värde"] = analysis[["Value1", "ValueX", "Value2"]].idxmax(axis=1).map(
                         {"Value1": "1", "ValueX": "X", "Value2": "2"}
                     )
+                    _sig_cols = [
+                        c
+                        for c in (
+                            "OddMv1",
+                            "OddMvX",
+                            "OddMv2",
+                            "StreckMv1",
+                            "StreckMvX",
+                            "StreckMv2",
+                            "StreckVol",
+                            "FormH_pts5",
+                            "FormB_pts5",
+                        )
+                        if c in analysis.columns
+                    ]
                     analysis_view = analysis[
                         ["Match", "Troligaste tecken", "Bäst värde", "Förslag", "P1", "PX", "P2"]
+                        + _sig_cols
                     ]
                     hist_path = API_HISTORY_PATH if API_HISTORY_PATH.exists() else None
                     ctx_df, ctx_note = build_free_context_for_coupon(
@@ -632,6 +650,17 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                                 st.write(
                                     f"Sannolikhet 1/X/2: {row['P1']:.3f} / {row['PX']:.3f} / {row['P2']:.3f}"
                                 )
+                                if _sig_cols:
+                                    st.caption("Signaler: " + ", ".join(_sig_cols))
+                                    for sc in _sig_cols:
+                                        v = row.get(sc)
+                                        if v is None or (isinstance(v, float) and pd.isna(v)):
+                                            v = "-"
+                                        elif isinstance(v, (int, float)) and sc.startswith("OddMv"):
+                                            v = f"{float(v) * 100:.1f}% rel."
+                                        elif isinstance(v, (int, float)) and sc.startswith("StreckMv"):
+                                            v = f"{float(v) * 100:.1f} pp"
+                                        st.caption(f"{sc}: {v}")
                                 st.divider()
                                 st.markdown("**Gratis tabell/form:**")
                                 for _, lab in CTX_COLUMN_LABELS.items():

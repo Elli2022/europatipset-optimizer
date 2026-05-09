@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+
+from coupon_enrichment import add_streck_volatility_column, enrich_coupon_with_history_form
 from dotenv import load_dotenv
 from sklearn.linear_model import LogisticRegression
 
@@ -259,6 +261,38 @@ def _extract_json_assignment(html: str, variable_name: str) -> dict:
     raise RuntimeError(f"Kunde inte extrahera JSON för {variable_name}.")
 
 
+def _odd_mv_triplet(curr: List[object], start: List[object], _to_float) -> Tuple[float, float, float]:
+    """Relativ odds-rörelse (curr-start)/start per utfall."""
+    out: List[float] = []
+    for i in range(3):
+        try:
+            c = _to_float(curr[i], np.nan)
+            s = _to_float(start[i], np.nan)
+            if np.isnan(c) or np.isnan(s) or s < 1.01:
+                out.append(float("nan"))
+            else:
+                out.append(float((c - s) / s))
+        except Exception:
+            out.append(float("nan"))
+    return float(out[0]), float(out[1]), float(out[2])
+
+
+def _streck_mv_triplet(curr_pct: List[object], prev_pct: List[object], _to_float) -> Tuple[float, float, float]:
+    """Streck-rörelse i andelsenheter (t.ex. 0.03 = +3 procentenheter)."""
+    out: List[float] = []
+    for i in range(3):
+        try:
+            c = _to_float(curr_pct[i], np.nan)
+            p = _to_float(prev_pct[i], np.nan)
+            if np.isnan(c) or np.isnan(p):
+                out.append(float("nan"))
+            else:
+                out.append(float((c - p) / 100.0))
+        except Exception:
+            out.append(float("nan"))
+    return float(out[0]), float(out[1]), float(out[2])
+
+
 def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
     url = "https://spela.svenskaspel.se/europatipset/statistik"
     response = requests.get(url, timeout=30)
@@ -359,6 +393,24 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
         fav1, favx, fav2 = _triplet_probs_percent(stat, "favourites")
         tio1, tiox, tio2 = _triplet_probs_counts(stat, "tioTidningarTips")
 
+        start_odds_vals = stat.get("startOdds", {}).get("current", {}).get("value", [None, None, None])
+        if len(start_odds_vals) != 3:
+            start_odds_vals = [None, None, None]
+
+        odd_mv1, odd_mv_x, odd_mv_2 = _odd_mv_triplet(list(odds_values), list(start_odds_vals), _to_float)
+
+        dist_prev = dist_draw.get("previous", {}).get("value", [None, None, None])
+        if len(dist_prev) != 3:
+            dist_prev = (
+                distributions.get("2", {})
+                .get("Global", {})
+                .get("previous", {})
+                .get("value", [None, None, None])
+            )
+        if len(dist_prev) != 3:
+            dist_prev = [None, None, None]
+        streck_mv1, streck_mv_x, streck_mv_2 = _streck_mv_triplet(dist_current, dist_prev, _to_float)
+
         rows.append(
             {
                 "Match": match,
@@ -374,6 +426,12 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
                 "Tio1": tio1,
                 "TioX": tiox,
                 "Tio2": tio2,
+                "OddMv1": odd_mv1,
+                "OddMvX": odd_mv_x,
+                "OddMv2": odd_mv_2,
+                "StreckMv1": streck_mv1,
+                "StreckMvX": streck_mv_x,
+                "StreckMv2": streck_mv_2,
             }
         )
 
@@ -750,6 +808,20 @@ def parse_coupon(coupon_csv: Path) -> pd.DataFrame:
     for col in ["Fav1", "FavX", "Fav2", "Tio1", "TioX", "Tio2"]:
         if col not in df.columns:
             df[col] = np.nan
+
+    for col in [
+        "OddMv1",
+        "OddMvX",
+        "OddMv2",
+        "StreckMv1",
+        "StreckMvX",
+        "StreckMv2",
+        "FormH_pts5",
+        "FormB_pts5",
+        "StreckVol",
+    ]:
+        if col not in df.columns:
+            df[col] = np.nan
     return df
 
 
@@ -832,6 +904,44 @@ def blend_probability_views(
     mix = np.clip(mix, 1e-9, 1.0)
     mix = mix / mix.sum()
     return float(mix[0]), float(mix[1]), float(mix[2])
+
+
+def adjust_probs_form_and_volatility(
+    p1: float,
+    px: float,
+    p2: float,
+    form_h_pts: float,
+    form_b_pts: float,
+    streck_vol: float,
+    *,
+    form_strength: float = 0.038,
+    form_scale_pts: float = 12.0,
+    vol_gamma: float = 2.6,
+    vol_cap: float = 0.22,
+) -> Tuple[float, float, float]:
+    """
+    Mild efterjustering efter blend: flytta lite massa 1↔2 utifrån formdiff,
+    platta ut mot 1/3 vid hög streck-volatilitet (osäker marknad).
+    """
+    p = np.clip(np.array([p1, px, p2], dtype=float), 1e-9, 1.0)
+    p = p / p.sum()
+
+    if not (np.isnan(form_h_pts) or np.isnan(form_b_pts)):
+        diff = float(form_h_pts) - float(form_b_pts)
+        nd = float(np.clip(diff / max(form_scale_pts, 1e-6), -1.0, 1.0))
+        adj = np.array([form_strength * nd, 0.0, -form_strength * nd], dtype=float)
+        p = p + adj
+        p = np.clip(p, 1e-9, 1.0)
+        p = p / p.sum()
+
+    if not np.isnan(streck_vol) and streck_vol >= 0:
+        lam = min(vol_cap, vol_gamma * float(streck_vol))
+        u = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float)
+        p = (1.0 - lam) * p + lam * u
+        p = np.clip(p, 1e-9, 1.0)
+        p = p / p.sum()
+
+    return float(p[0]), float(p[1]), float(p[2])
 
 
 def optimize_system(
@@ -1007,6 +1117,8 @@ def suggest_system(
         model = pickle.load(f)
 
     coupon = enforce_game_type(parse_coupon(coupon_csv), game_type=game_type)
+    coupon = enrich_coupon_with_history_form(coupon, coupon_csv)
+    coupon = add_streck_volatility_column(coupon)
     matches: List[MatchSuggestion] = []
 
     for _, row in coupon.iterrows():
@@ -1031,6 +1143,19 @@ def suggest_system(
             fav_trip,
             tio_trip,
         )
+        try:
+            fh = float(row["FormH_pts5"])
+        except Exception:
+            fh = float("nan")
+        try:
+            fb = float(row["FormB_pts5"])
+        except Exception:
+            fb = float("nan")
+        try:
+            sv = float(row["StreckVol"])
+        except Exception:
+            sv = float("nan")
+        p1, px, p2 = adjust_probs_form_and_volatility(p1, px, p2, fh, fb, sv)
         m = MatchSuggestion(
             match=str(row["Match"]),
             odd1=float(row["Odd1"]),
