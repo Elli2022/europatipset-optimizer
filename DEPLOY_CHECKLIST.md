@@ -48,6 +48,10 @@ BOOTSTRAP_HISTORY_YEARS = "3"
 - If sync fails, confirm API key is valid and free-tier quota is not exhausted
 - Reboot app after major dependency updates
 
-## 6) Ephemeral disk (Mina spel)
+## 6) Spellogg på Cloud
 
-Spelloggen (`data/user/play_journal.json`) sparas på serverns lokala disk. På Streamlit Community Cloud kan den **nollställas** vid cold start eller omstart. Använd **Exportera spellogg (JSON)** i appen om du behöver beständighet, eller kör verktyget lokalt med committad/backupad `data/user/`.
+Spelloggen skrivs till `data/user/play_journal.json` på servern **och** speglas automatiskt till besökarens webbläsare (**localStorage** via `streamlit-js-eval`). Det gör att historiken vanligtvis överlever Cloud-omstarter utan manuell export.
+
+Serverkopian kan ändå nollställas — första sidladdning efter omstart hämtar då tillbaka journalen från webbläsaren om användaren inte rensat den.
+
+Om du byter webbläsare eller enhet: använd **Exportera spellogg (JSON)** som backup.

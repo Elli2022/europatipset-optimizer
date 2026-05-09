@@ -12,6 +12,7 @@ from europatipset import (
     assess_forecast_confidence,
     backtest_strategies,
     download_historical_data,
+    fetch_correct_row_for_draw_number,
     fetch_official_coupon_state,
     recommend_max_stake,
     simulate_rights_distribution,
@@ -21,6 +22,7 @@ from europatipset import (
     train_model,
     validate_coupon_data,
 )
+from journal_browser_sync import ensure_journal_merged_once_session, sync_journal_to_browser
 from play_journal import (
     add_pending_bet,
     append_outcomes_training_rows,
@@ -223,11 +225,15 @@ def _render_my_spel_page() -> None:
     st.subheader("Mina spel")
     st.caption(
         "Spara kupong och förslag innan du lägger spelet. Efter rättning kan du ange "
-        "13-teckensrad (1/X/2) för enkel miss-analys. Data lagras under `data/user/` på denna instans."
+        "13-teckensrad (1/X/2) för enkel miss-analys."
     )
-    st.warning(
-        "Streamlit Community Cloud har ofta tillfällig disk — journalen kan försvinna vid omstart. "
-        "Exportera JSON nedan om du vill behålla historiken."
+    st.success(
+        "Historiken sparas **automatiskt i din webbläsare** (localStorage) och följer med "
+        "vid omstart av Streamlit Cloud — du behöver inte exportera JSON i normalfallet."
+    )
+    st.info(
+        "Byter du webbläsare eller rensar sajtdatum försvinner lokala kopior; använd export nedan "
+        "som backup eller spela i samma webbläsare på den enhet du brukar."
     )
 
     data = load_journal(JOURNAL_PATH)
@@ -235,14 +241,6 @@ def _render_my_spel_page() -> None:
     settled = [b for b in data["bets"] if b.get("status") == "settled"]
 
     raw_json = json.dumps(data, ensure_ascii=False, indent=2)
-    st.download_button(
-        "Exportera spellogg (JSON)",
-        data=raw_json.encode("utf-8"),
-        file_name="play_journal_export.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
     ej_tab, rt_tab = st.tabs(["Ej rättade", "Rättade"])
     with ej_tab:
         if not pending:
@@ -254,6 +252,14 @@ def _render_my_spel_page() -> None:
             title = f"{bet.get('draw_comment', 'Omgång')} · rader {bet.get('system_rows', '-')}"
             with st.expander(title, expanded=False):
                 st.caption(f"ID `{bet['id']}` · spelstopp `{bet.get('reg_close_time', '-')}`")
+                dn = str(bet.get("draw_number", "")).strip()
+                ref_row, ref_msg = fetch_correct_row_for_draw_number(dn)
+                st.caption(ref_msg)
+                if ref_row:
+                    st.code(ref_row, language=None)
+                    if st.button("Lägg in referensrad i fältet", key=f"apply_ref_{bet['id']}"):
+                        st.session_state[f"out_{bet['id']}"] = ref_row
+                        st.rerun()
                 rec_rows = bet.get("recommendation_rows") or []
                 if rec_rows:
                     cols = [c for c in ["Match", "Förslag", "P1", "PX", "P2"] if c in rec_rows[0]]
@@ -283,6 +289,7 @@ def _render_my_spel_page() -> None:
                             bet["id"],
                             int(hits_best),
                             o if len(o) == 13 else None,
+                            after_save=sync_journal_to_browser,
                         )
                         if len(o) == 13 and rec_rows:
                             append_outcomes_training_rows(BASE_DIR, rec_rows, o)
@@ -310,6 +317,15 @@ def _render_my_spel_page() -> None:
             with st.expander("Detaljer — senaste rättade"):
                 bet = settled[0]
                 st.json(bet)
+
+    st.markdown("##### Valfri backup (JSON)")
+    st.download_button(
+        "Exportera spellogg (JSON)",
+        data=raw_json.encode("utf-8"),
+        file_name="play_journal_export.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 
 st.set_page_config(page_title="Europatipset Optimizer", page_icon="⚽", layout="wide")
@@ -339,6 +355,8 @@ if not MODEL_PATH.exists():
 
 with st.sidebar:
     page_section = st.radio("Sektion", ["Analyser", "Mina spel"], index=0)
+
+ensure_journal_merged_once_session(JOURNAL_PATH)
 
 if page_section == "Mina spel":
     st.title("Mina spel")
@@ -432,6 +450,8 @@ with st.expander("Om modellen — vad som ingår (och inte)"):
 Förslagen bygger på **matchodds**, **streckfördelning**, **historisk kalibrering** mot din nedladdade historik
 och **Monte Carlo-simulering** av täckning — inte på skador, elvor eller nyhetsflöden såvida du inte matar in sådan data själv.
 
+Vid hämtning av kupong försöker appen även läsa en **publik referensrad** (utfall per match) från Svenska Spels tips-data när den finns — samma begränsning: ingen skada/uppställningsdata.
+
 Det betyder att modellen kan missa när oddsen inte hunnit reagera på sent besked; använd sunda marginaler och egen matchkunskap vid osäkerhet.
         """
     )
@@ -448,6 +468,7 @@ if "backtest_df" not in st.session_state:
 if st.button("Hämta officiell kupong och beräkna förslag", type="primary", use_container_width=True):
     with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
         try:
+            st.session_state.pop("sv_ref", None)
             coupon_df, meta = fetch_official_coupon_state()
             INPUT_DIR.mkdir(parents=True, exist_ok=True)
             coupon_df.to_csv(OFFICIAL_COUPON_PATH, index=False)
@@ -456,6 +477,8 @@ if st.button("Hämta officiell kupong och beräkna förslag", type="primary", us
             st.session_state["result_df"] = result_df
             st.session_state["meta"] = meta
             st.session_state["forecast_dist"] = None
+            rr, rm = fetch_correct_row_for_draw_number(str(meta.get("draw_number", "")))
+            st.session_state["sv_ref"] = {"dn": str(meta.get("draw_number", "")), "row": rr, "msg": rm}
         except Exception as exc:
             st.error(f"Kunde inte hämta eller beräkna kupong: {exc}")
 
@@ -470,6 +493,17 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                 st.write(details)
                 st.caption(f"Senast uppdaterad: {datetime.now(ZoneInfo('Europe/Stockholm')).strftime('%Y-%m-%d %H:%M:%S')}")
                 _last_hour_warning(meta)
+
+                pack = st.session_state.get("sv_ref") or {}
+                if pack.get("dn") == str(meta.get("draw_number", "")):
+                    if pack.get("row"):
+                        st.info(
+                            "Publik **referensrad** för denna omgången (läst från Svenska Spels tips-sidor när utfallet "
+                            "finns i deras JSON — inte skador eller elvor): "
+                            f"`{pack['row']}`"
+                        )
+                    elif pack.get("msg"):
+                        st.caption(str(pack["msg"]))
 
                 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
                     [
@@ -534,6 +568,7 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                             result_df,
                             int(result_df["Systemrader"].iloc[0]),
                             "",
+                            after_save=sync_journal_to_browser,
                         )
                         st.success(
                             f"Sparat som `{bid}`. Byt till **Mina spel** i sidopanelen för att rätta efter omgången."

@@ -1,8 +1,8 @@
 """
 Lokal spellogg för kuponger/rekommendationer och rättade omgångar.
 
-OBS: Streamlit Community Cloud har ofta efemär disk — loggen kan försvinna vid cold start.
-För permanent historik: exportera JSON eller koppla extern databas.
+OBS: Serverdisk på Streamlit Cloud kan vara tillfällig — spelloggen speglas därför även till
+webbläsarens localStorage från UI (se journal_browser_sync). JSON-export är valfri backup.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -50,6 +50,64 @@ def _empty_aggregate() -> Dict[str, Any]:
         "miss_on_single_pick": 0,
         "miss_on_single_favorite": 0,
         "miss_on_single_underdog": 0,
+    }
+
+
+def rebuild_aggregate_from_bets(bets: List[Dict[str, Any]]) -> Dict[str, Any]:
+    agg = _empty_aggregate()
+    for bet in bets:
+        if bet.get("status") != "settled":
+            continue
+        ins = bet.get("insights") or {}
+        misses = ins.get("misses_detail")
+        if not misses:
+            continue
+        agg["settled_rounds"] = int(agg["settled_rounds"]) + 1
+        for m in misses:
+            agg["miss_events_total"] = int(agg["miss_events_total"]) + 1
+            if m.get("single_pick"):
+                agg["miss_on_single_pick"] = int(agg["miss_on_single_pick"]) + 1
+                if m.get("favorite_side"):
+                    agg["miss_on_single_favorite"] = int(agg["miss_on_single_favorite"]) + 1
+                else:
+                    agg["miss_on_single_underdog"] = int(agg["miss_on_single_underdog"]) + 1
+    return agg
+
+
+def _pick_newer_duplicate_bet(ba: Dict[str, Any], bb: Dict[str, Any]) -> Dict[str, Any]:
+    sa, sb = ba.get("status"), bb.get("status")
+    if sa != sb:
+        return bb if sb == "settled" else ba
+    if sa == "settled" and sb == "settled":
+        return bb if bb.get("settled_at", "") >= ba.get("settled_at", "") else ba
+    return bb if bb.get("saved_at", "") >= ba.get("saved_at", "") else ba
+
+
+def merge_journal_data(
+    a: Optional[Dict[str, Any]],
+    b: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Slår ihop två journaldicts (t.ex. disk + webbläsare); deduplicerar på bet-id."""
+    aa = a if isinstance(a, dict) else {"version": 1, "bets": [], "aggregate": _empty_aggregate()}
+    bb = b if isinstance(b, dict) else {"version": 1, "bets": [], "aggregate": _empty_aggregate()}
+    bets_a = {str(x["id"]): x for x in (aa.get("bets") or []) if x.get("id")}
+    bets_b = {str(x["id"]): x for x in (bb.get("bets") or []) if x.get("id")}
+    merged_map: Dict[str, Dict[str, Any]] = {}
+    for bid in set(bets_a) | set(bets_b):
+        ba = bets_a.get(bid)
+        bb = bets_b.get(bid)
+        if ba is None:
+            merged_map[bid] = bb  # type: ignore[assignment]
+        elif bb is None:
+            merged_map[bid] = ba
+        else:
+            merged_map[bid] = _pick_newer_duplicate_bet(ba, bb)
+    bets_list = sorted(merged_map.values(), key=lambda x: x.get("saved_at", ""), reverse=True)
+    ver = max(int(aa.get("version", 1)), int(bb.get("version", 1)))
+    return {
+        "version": ver,
+        "bets": bets_list,
+        "aggregate": rebuild_aggregate_from_bets(bets_list),
     }
 
 
@@ -105,6 +163,7 @@ def settle_bet(
     bet_id: str,
     hits_best_row: int,
     outcomes_13: Optional[str],
+    after_save: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     data = load_journal(journal_path)
     bet = None
@@ -140,6 +199,8 @@ def settle_bet(
         bet["outcomes_13"] = outcomes_13.strip().upper()
 
     save_journal(journal_path, data)
+    if after_save:
+        after_save(data)
     return bet
 
 
@@ -150,6 +211,7 @@ def add_pending_bet(
     recommendation_df: pd.DataFrame,
     system_rows: int,
     note: str = "",
+    after_save: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     data = load_journal(journal_path)
     bet_id = f"bet_{uuid.uuid4().hex[:10]}"
@@ -168,6 +230,8 @@ def add_pending_bet(
     }
     data["bets"].insert(0, bet)
     save_journal(journal_path, data)
+    if after_save:
+        after_save(data)
     return bet_id
 
 

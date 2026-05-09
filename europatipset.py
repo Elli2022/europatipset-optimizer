@@ -2,11 +2,12 @@ import argparse
 import json
 import math
 import os
+import re
 import pickle
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -343,6 +344,147 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "row_price": str(draw.get("rowPrice", "")),
     }
     return out, meta
+
+
+def _fetch_tipsen_preloaded_state(url: str) -> Dict:
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return _extract_json_assignment(response.text, "_svs.tipsen.data.preloadedState")
+
+
+def outcome_to_sign(outcomes: object) -> Optional[str]:
+    """
+    Tolka Svenska Spels tips-data `outcomes`-fält till 1/X/2 när möjligt.
+    Strukturen varierar — hantera vanliga varianter defensivt.
+    """
+    if outcomes is None:
+        return None
+    if isinstance(outcomes, str):
+        t = outcomes.strip().upper().replace("TIE", "X")
+        return t if t in {"1", "X", "2"} else None
+    if isinstance(outcomes, dict):
+        for key in ("sign", "label", "type", "outcomeSign"):
+            s = outcome_to_sign(outcomes.get(key))
+            if s:
+                return s
+        # hem/oavgjort/borta-flaggor
+        if outcomes.get("homeWin") is True or outcomes.get("one") is True:
+            return "1"
+        if outcomes.get("draw") is True or outcomes.get("tie") is True or outcomes.get("x") is True:
+            return "X"
+        if outcomes.get("awayWin") is True or outcomes.get("two") is True:
+            return "2"
+        return None
+    if isinstance(outcomes, list):
+        chosen = None
+        for item in outcomes:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", "")).upper()
+            won = item.get("won")
+            if won is True or status in {"WON", "WINNING"}:
+                chosen = item
+                break
+        if chosen is None:
+            return None
+        if chosen.get("outcome"):
+            s = outcome_to_sign(chosen.get("outcome"))
+            if s:
+                return s
+        return outcome_to_sign(chosen.get("label")) or outcome_to_sign(chosen.get("sign"))
+    return None
+
+
+def score_text_to_sign(text: Optional[str]) -> Optional[str]:
+    if not text or not isinstance(text, str):
+        return None
+    m = re.search(r"(\d+)\s*[-–]\s*(\d+)", text)
+    if not m:
+        return None
+    home_goals, away_goals = int(m.group(1)), int(m.group(2))
+    if home_goals > away_goals:
+        return "1"
+    if home_goals < away_goals:
+        return "2"
+    return "X"
+
+
+def extract_sign_from_draw_event(ev: Dict) -> Optional[str]:
+    s = outcome_to_sign(ev.get("outcomes"))
+    if s:
+        return s
+    return score_text_to_sign(ev.get("extraInfo")) or score_text_to_sign(ev.get("eventComment"))
+
+
+def extract_correct_row_from_draw(draw: Dict) -> Optional[str]:
+    events = sorted(draw.get("drawEvents") or [], key=lambda e: int(e.get("eventNumber", 0)))
+    if len(events) < 13:
+        return None
+    sigs: List[str] = []
+    for ev in events[:13]:
+        if ev.get("cancelled"):
+            return None
+        sign = extract_sign_from_draw_event(ev)
+        if sign is None:
+            return None
+        sigs.append(sign)
+    return "".join(sigs)
+
+
+def merged_draw_entities_from_tipsen_urls(urls: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
+    merged: Dict[str, Dict] = {}
+    errors: List[str] = []
+    for url in urls:
+        try:
+            state = _fetch_tipsen_preloaded_state(url)
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+        if not isinstance(state, dict):
+            continue
+        ents = state.get("Draws", {}).get("entities", {})
+        if isinstance(ents, dict):
+            for draw_key, draw_val in ents.items():
+                if isinstance(draw_val, dict):
+                    merged[str(draw_key)] = draw_val
+    return merged, errors
+
+
+def fetch_correct_row_for_draw_number(draw_number: str) -> Tuple[Optional[str], str]:
+    """
+    Försök läsa en komplett 13-teckensrad för given omgång ur publika tips-sidor (ingen inloggning).
+    Fungerar först när Svenska Spel bundit utfall till drawEvents (ofta efter avslutade matcher).
+    """
+    urls = [
+        "https://www.svenskaspel.se/europatipset/resultat",
+        "https://spela.svenskaspel.se/europatipset/statistik",
+    ]
+    merged, errs = merged_draw_entities_from_tipsen_urls(urls)
+    if not merged:
+        hint = " | ".join(errs) if errs else "okänt fel"
+        return None, f"Kunde inte läsa tips-data från Svenska Spel ({hint})."
+
+    target = str(draw_number).strip()
+    candidates: List[Dict] = []
+    for draw in merged.values():
+        if str(draw.get("drawNumber", "")).strip() == target:
+            candidates.append(draw)
+
+    if not candidates:
+        return (
+            None,
+            "Hittade ingen omgång med detta draw-nummer i den publika datan just nu.",
+        )
+
+    for draw in candidates:
+        row = extract_correct_row_from_draw(draw)
+        if row:
+            return row, "Läste referensrad från Svenska Spels publika tips-data (utan skador/elvor)."
+
+    return (
+        None,
+        "Omgången finns men saknar kompletta utfall i publik JSON än — prova igen efter matcher eller ange rad manuellt.",
+    )
 
 
 def auto_refresh_official_snapshot(

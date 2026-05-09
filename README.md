@@ -140,7 +140,7 @@ I UI:t kan du:
 - välja omgångstyp (`europatipset`/`topptipset`)
 - spara spelade kuponger under **Mina spel**, rätta med antal rätt och valfri 13-teckensrad för enkel lärdom
 
-**Streamlit Cloud:** disk på gratisnivå är ofta **tillfällig** — filer under `data/user/` (spelloggen) kan försvinna vid omstart. Använd **Exportera spellogg** i **Mina spel** om du vill behålla historiken.
+**Streamlit Cloud:** serverdisk kan vara **tillfällig**, men **Mina spel** speglas automatiskt till din webbläsares **localStorage** (ingen JSON-export krävs i normalfallet). Byter du webbläsare eller rensar du sajtdatum kan historiken ändå försvinna — då är JSON-export en bra backup.
 
 ## Deploy
 
