@@ -461,12 +461,16 @@ st.write("1) Hämta officiell kupong  2) Välj strategi/budget  3) Analysera och
 with st.expander("Om modellen — vad som ingår (och inte)"):
     st.markdown(
         """
-Förslagen bygger på **matchodds**, **streckfördelning**, **historisk kalibrering** mot din nedladdade historik
-och **Monte Carlo-simulering** av täckning — inte på skador, elvor eller nyhetsflöden såvida du inte matar in sådan data själv.
+Förslagen bygger på **matchodds**, **streck**, **kalibrerad modell** och en **viktad blandning** med extra fält som finns i Svenska Spels **publika**
+tips-JSON (bl.a. «favourites» och tidningsröster `tioTidningarTips` när de inte är tomma). Det är **inte** startelvor,
+xG-detaljer, nyhetsartiklar eller Oddset-kors — den datan levereras inte i samma öppna payload som statistiksidan,
+och kräver i praktiken andra produkter/API:er eller licenser.
 
-Vid hämtning av kupong försöker appen även läsa en **publik referensrad** (utfall per match) från Svenska Spels tips-data när den finns — samma begränsning: ingen skada/uppställningsdata.
+Gratis **ligatabell + form** under Matchanalys hämtas separat via football-data.org (gratisplan + din API-historik).
 
-Det betyder att modellen kan missa när oddsen inte hunnit reagera på sent besked; använd sunda marginaler och egen matchkunskap vid osäkerhet.
+Vid hämtning av kupong försöker appen även läsa en **publik referensrad** när utfallet finns i tips-data.
+
+Det betyder att modellen kan missa sent nyheter; använd sunda marginaler och egen matchkunskap vid osäkerhet.
         """
     )
 

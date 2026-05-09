@@ -2,6 +2,7 @@ import pandas as pd
 
 from europatipset import (
     MatchSuggestion,
+    blend_probability_views,
     optimize_system,
     recommend_max_stake,
     simulate_rights_distribution,
@@ -44,6 +45,32 @@ def test_recommend_max_stake_basic():
     rec = recommend_max_stake(forecast, payouts, margin_pct=10, bankroll_cap=500)
     assert rec["max_break_even"] >= 0
     assert rec["recommended_max"] <= 500
+
+
+def test_blend_probability_views_mixes_sources():
+    p = blend_probability_views(
+        (0.55, 0.25, 0.20),
+        (0.40, 0.30, 0.30),
+        (0.70, 0.15, 0.15),
+        (0.50, 0.25, 0.25),
+        w_cal=0.50,
+        w_streck=0.25,
+        w_fav=0.15,
+        w_tio=0.10,
+    )
+    assert len(p) == 3
+    assert abs(sum(p) - 1.0) < 1e-6
+    assert p[0] > 0.45
+
+
+def test_blend_probability_views_falls_back_when_fav_missing():
+    p = blend_probability_views(
+        (0.34, 0.33, 0.33),
+        (0.50, 0.25, 0.25),
+        None,
+        None,
+    )
+    assert abs(sum(p) - 1.0) < 1e-6
 
 
 def test_validate_coupon_data_flags_invalid_odds():

@@ -123,6 +123,9 @@ Starta appen:
 streamlit run streamlit_app.py
 ```
 
+Modellen blandar kalibrerade odds-sannolikheter med **streck**, **Svenska Spels favourites-andel** och **tidningsröster**
+(`tioTidningarTips`) när de finns i den officiella kupongen — inte skador/elvor (finns inte i samma öppna JSON).
+
 I UI:t kan du:
 
 - hämta officiell kupong och streck med en knapp

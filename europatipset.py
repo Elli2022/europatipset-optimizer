@@ -319,6 +319,46 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
             except Exception:
                 return default
 
+        def _triplet_probs_percent(stat_block: Dict, key: str) -> Tuple[float, float, float]:
+            """Läser tre procent-strängar (0–100) och normaliserar till sannolikheter."""
+            vals = (
+                stat_block.get(key, {})
+                .get("current", {})
+                .get("value", [None, None, None])
+            )
+            if len(vals) != 3 or any(v in [None, ""] for v in vals):
+                return (np.nan, np.nan, np.nan)
+            a = _to_float(vals[0], np.nan)
+            b = _to_float(vals[1], np.nan)
+            c = _to_float(vals[2], np.nan)
+            if any(np.isnan([a, b, c])):
+                return (np.nan, np.nan, np.nan)
+            tot = a + b + c
+            if tot <= 0:
+                return (np.nan, np.nan, np.nan)
+            return float(a / tot), float(b / tot), float(c / tot)
+
+        def _triplet_probs_counts(stat_block: Dict, key: str) -> Tuple[float, float, float]:
+            """Tolkar tre heltalsröster (t.ex. tidningstips) som frekvenser."""
+            vals = (
+                stat_block.get(key, {})
+                .get("current", {})
+                .get("value", [None, None, None])
+            )
+            if len(vals) != 3 or any(v is None for v in vals):
+                return (np.nan, np.nan, np.nan)
+            try:
+                ia, ib, ic = int(vals[0]), int(vals[1]), int(vals[2])
+            except Exception:
+                return (np.nan, np.nan, np.nan)
+            tot = ia + ib + ic
+            if tot <= 0:
+                return (np.nan, np.nan, np.nan)
+            return ia / tot, ib / tot, ic / tot
+
+        fav1, favx, fav2 = _triplet_probs_percent(stat, "favourites")
+        tio1, tiox, tio2 = _triplet_probs_counts(stat, "tioTidningarTips")
+
         rows.append(
             {
                 "Match": match,
@@ -328,6 +368,12 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
                 "Streck1": _to_float(dist_current[0], 33.33),
                 "StreckX": _to_float(dist_current[1], 33.33),
                 "Streck2": _to_float(dist_current[2], 33.33),
+                "Fav1": fav1,
+                "FavX": favx,
+                "Fav2": fav2,
+                "Tio1": tio1,
+                "TioX": tiox,
+                "Tio2": tio2,
             }
         )
 
@@ -700,6 +746,10 @@ def parse_coupon(coupon_csv: Path) -> pd.DataFrame:
     for col in ["Streck1", "StreckX", "Streck2"]:
         if df[col].max() > 1.5:
             df[col] = df[col] / 100.0
+
+    for col in ["Fav1", "FavX", "Fav2", "Tio1", "TioX", "Tio2"]:
+        if col not in df.columns:
+            df[col] = np.nan
     return df
 
 
@@ -719,6 +769,69 @@ def calibrated_probs(model, odd1: float, oddx: float, odd2: float) -> Tuple[floa
     x = np.log(np.clip(p_raw, 1e-6, 1)).reshape(1, -1)
     p = model.predict_proba(x)[0]
     return float(p[0]), float(p[1]), float(p[2])
+
+
+def blend_probability_views(
+    p_cal: Tuple[float, float, float],
+    streck: Tuple[float, float, float],
+    fav: Optional[Tuple[float, float, float]] = None,
+    tio: Optional[Tuple[float, float, float]] = None,
+    *,
+    w_cal: float = 0.62,
+    w_streck: float = 0.23,
+    w_fav: float = 0.10,
+    w_tio: float = 0.05,
+) -> Tuple[float, float, float]:
+    """
+    Kombinerar kalibrerad odds-modell med streck, Svenska Spels «favourites»-fördelning
+    och tidnings-röster (tioTidningarTips) när de finns i kupongens JSON/spreadsheet.
+
+    Detta ersätter inte riktiga skador/elvor — bara extra signaler ur samma publika tips-flöde.
+    """
+    pc = np.clip(np.array(p_cal, dtype=float), 1e-9, 1.0)
+    pc = pc / pc.sum()
+    st = np.clip(np.array(streck, dtype=float), 1e-9, 1.0)
+    st = st / st.sum()
+
+    wf_cal = float(w_cal)
+    wf_st = float(w_streck)
+    wf_fav = float(w_fav)
+    wf_tio = float(w_tio)
+
+    use_fav = (
+        fav is not None
+        and len(fav) == 3
+        and all(not (isinstance(x, float) and np.isnan(x)) for x in fav)
+    )
+    use_tio = (
+        tio is not None
+        and len(tio) == 3
+        and all(not (isinstance(x, float) and np.isnan(x)) for x in tio)
+    )
+    if not use_fav:
+        wf_cal += wf_fav
+        wf_fav = 0.0
+    if not use_tio:
+        wf_cal += wf_tio
+        wf_tio = 0.0
+
+    tot_w = wf_cal + wf_st + wf_fav + wf_tio
+    if tot_w <= 0:
+        return float(pc[0]), float(pc[1]), float(pc[2])
+
+    mix = (wf_cal / tot_w) * pc + (wf_st / tot_w) * st
+    if wf_fav > 0 and fav is not None:
+        fv = np.clip(np.array(fav, dtype=float), 1e-9, 1.0)
+        fv = fv / fv.sum()
+        mix += (wf_fav / tot_w) * fv
+    if wf_tio > 0 and tio is not None:
+        tv = np.clip(np.array(tio, dtype=float), 1e-9, 1.0)
+        tv = tv / tv.sum()
+        mix += (wf_tio / tot_w) * tv
+
+    mix = np.clip(mix, 1e-9, 1.0)
+    mix = mix / mix.sum()
+    return float(mix[0]), float(mix[1]), float(mix[2])
 
 
 def optimize_system(
@@ -898,6 +1011,26 @@ def suggest_system(
 
     for _, row in coupon.iterrows():
         p1, px, p2 = calibrated_probs(model, float(row["Odd1"]), float(row["OddX"]), float(row["Odd2"]))
+        streck_trip = (float(row["Streck1"]), float(row["StreckX"]), float(row["Streck2"]))
+        fav_trip: Optional[Tuple[float, float, float]] = None
+        tio_trip: Optional[Tuple[float, float, float]] = None
+        try:
+            if all(pd.notna(row.get(c)) for c in ("Fav1", "FavX", "Fav2")):
+                fav_trip = (float(row["Fav1"]), float(row["FavX"]), float(row["Fav2"]))
+        except Exception:
+            fav_trip = None
+        try:
+            if all(pd.notna(row.get(c)) for c in ("Tio1", "TioX", "Tio2")):
+                tio_trip = (float(row["Tio1"]), float(row["TioX"]), float(row["Tio2"]))
+        except Exception:
+            tio_trip = None
+
+        p1, px, p2 = blend_probability_views(
+            (p1, px, p2),
+            streck_trip,
+            fav_trip,
+            tio_trip,
+        )
         m = MatchSuggestion(
             match=str(row["Match"]),
             odd1=float(row["Odd1"]),
