@@ -24,6 +24,12 @@ from europatipset import (
 )
 from free_context import build_free_context_for_coupon
 from journal_browser_sync import ensure_journal_merged_once_session, sync_journal_to_browser
+from svenskaspel_context import (
+    context_matches_dataframe,
+    fetch_europatipset_round_context,
+    load_round_context_bundle,
+    save_round_context_bundle,
+)
 from play_journal import (
     add_pending_bet,
     append_outcomes_training_rows,
@@ -42,6 +48,7 @@ MODEL_PATH = DATA_DIR / "models" / "calibration.pkl"
 OFFICIAL_COUPON_PATH = INPUT_DIR / "official_coupon.csv"
 RECOMMENDATION_PATH = OUTPUT_DIR / "recommendation_official.csv"
 API_HISTORY_PATH = DATA_DIR / "raw" / "history_api.csv"
+SS_CONTEXT_PATH = DATA_DIR / "raw" / "svenskaspel_round_context.json"
 OFFICIAL_META_PATH = INPUT_DIR / "official_meta.json"
 HISTORY_CSV = DATA_DIR / "raw" / "history.csv"
 USER_DATA_DIR = DATA_DIR / "user"
@@ -482,6 +489,8 @@ if "meta" not in st.session_state:
     st.session_state["meta"] = {}
 if "backtest_df" not in st.session_state:
     st.session_state["backtest_df"] = None
+if "ss_context_bundle" not in st.session_state:
+    st.session_state["ss_context_bundle"] = None
 
 if st.button("Hämta officiell kupong och beräkna förslag", type="primary", use_container_width=True):
     with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
@@ -822,6 +831,45 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         )
 
                 with tab6:
+                    st.markdown("#### Inför omgången — Svenska Spel (publik JSON)")
+                    st.caption(
+                        "Hämtar samma **inbäddade tipsen-state** som webbsidan (matcher, tider, ligor, "
+                        "Sportradar/Kambi-id, ev. `eventComment`). Full **xStats, tabell, nyheter och elvor** "
+                        "ligger ofta i separata anrop — inte i denna JSON. Respektera Svenska Spels villkor."
+                    )
+
+                    c_ss1, c_ss2 = st.columns(2)
+                    with c_ss1:
+                        if st.button("Hämta / uppdatera från spela.svenskaspel.se", key="fetch_ss_context"):
+                            with st.spinner("Hämtar Europatipset-sida…"):
+                                b = fetch_europatipset_round_context()
+                                save_round_context_bundle(b, SS_CONTEXT_PATH)
+                                st.session_state["ss_context_bundle"] = b
+                            st.success(f"Sparat: `{SS_CONTEXT_PATH}`")
+                    with c_ss2:
+                        if st.button("Läs sparad kontext från disk", key="reload_ss_context_disk"):
+                            st.session_state["ss_context_bundle"] = load_round_context_bundle(SS_CONTEXT_PATH)
+
+                    bundle = st.session_state.get("ss_context_bundle")
+                    if bundle is None:
+                        bundle = load_round_context_bundle(SS_CONTEXT_PATH)
+                    if bundle:
+                        st.caption(
+                            f"Hämtad (UTC): `{bundle.get('fetchedAtUtc', '')}` · Källa: `{bundle.get('sourceUrl', '')}`"
+                        )
+                        df_ctx = context_matches_dataframe(bundle)
+                        if not df_ctx.empty:
+                            st.dataframe(df_ctx, use_container_width=True, hide_index=True)
+                        with st.expander("Omgångs-meta + disclaimer"):
+                            st.json(
+                                {
+                                    "draw": bundle.get("draw"),
+                                    "disclaimer": bundle.get("disclaimer"),
+                                }
+                            )
+                    else:
+                        st.info("Ingen kontext sparad än — tryck på «Hämta / uppdatera».")
+
                     st.markdown("#### Officiell kupong")
                     if mobile_mode:
                         for _, row in coupon_df.iterrows():

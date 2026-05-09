@@ -1500,6 +1500,17 @@ def main():
         help="Kör backtest per signal-profil (form/vol/fav/tio) och rapportera bl.a. FullHitRate vs ROI.",
     )
 
+    fc = sub.add_parser(
+        "fetch-ss-context",
+        help="Hämta inför-omgång-data (inbäddad tipsen-JSON från Europatipset-sidan) till fil.",
+    )
+    fc.add_argument("--out", default="data/raw/svenskaspel_round_context.json")
+    fc.add_argument(
+        "--prefer-statistik-first",
+        action="store_true",
+        help="Försök statistik-URL först (samma state som huvudsidan i regel).",
+    )
+
     args = parser.parse_args()
 
     if args.cmd == "download":
@@ -1561,6 +1572,21 @@ def main():
         out.to_csv(args.out, index=False)
         print(f"Backtest sparat: {args.out}")
         print(out.to_string(index=False))
+    elif args.cmd == "fetch-ss-context":
+        from svenskaspel_context import (
+            EUROPATIPSET_PAGE,
+            EUROPATIPSET_STATISTIK,
+            fetch_europatipset_round_context,
+            save_round_context_bundle,
+        )
+
+        urls = [EUROPATIPSET_STATISTIK, EUROPATIPSET_PAGE] if args.prefer_statistik_first else None
+        bundle = fetch_europatipset_round_context(urls=urls)
+        outp = Path(args.out)
+        save_round_context_bundle(bundle, outp)
+        n_m = len(bundle.get("matches") or [])
+        print(f"Sparad kontext: {outp} ({n_m} matcher)")
+        print(f"Källa: {bundle.get('sourceUrl')}")
 
 
 if __name__ == "__main__":
