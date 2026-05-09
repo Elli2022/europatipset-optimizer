@@ -85,3 +85,10 @@ def test_adjust_volatility_moves_toward_uniform():
     base = (0.55, 0.28, 0.17)
     flat = adjust_probs_form_and_volatility(*base, float("nan"), float("nan"), 0.2)
     assert ent(flat) > ent(base) - 1e-6
+
+
+def test_adjust_form_disabled_ignores_form_diff():
+    a = adjust_probs_form_and_volatility(0.34, 0.33, 0.33, 15.0, 0.0, float("nan"), enable_form=False)
+    b = adjust_probs_form_and_volatility(0.34, 0.33, 0.33, 0.0, 15.0, float("nan"), enable_form=False)
+    assert abs(a[0] - b[0]) < 1e-9
+    assert abs(a[2] - b[2]) < 1e-9

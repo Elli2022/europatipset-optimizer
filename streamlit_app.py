@@ -855,6 +855,11 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         )
                     with c2:
                         bt_n = st.slider("Antal historiska kuponger", min_value=10, max_value=120, value=40, step=10)
+                    bt_signal_ablation = st.checkbox(
+                        "Jämför per signal (ablation, långsammare)",
+                        value=False,
+                        help="Kör samma sweep för varje signal-profil och jämför ROI mot 13-rätt-andel — undvik att «tuna» bara mot hög träff i sim.",
+                    )
 
                     if st.button("Kör backtest", key="run_backtest"):
                         with st.spinner("Kör backtest över historik..."):
@@ -869,16 +874,30 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                                     strategies=["balanced", "safe", "value"],
                                     game_type=st.session_state.get("game_type", "europatipset"),
                                     n_coupons=int(bt_n),
+                                    compare_signal_profiles=bool(bt_signal_ablation),
                                 )
                                 st.session_state["backtest_df"] = bt
+                                st.session_state["backtest_signal_ablation"] = bool(bt_signal_ablation)
                     if st.session_state.get("backtest_df") is not None:
                         bt = st.session_state["backtest_df"]
+                        bt_ablation = bool(st.session_state.get("backtest_signal_ablation"))
+                        if bt_ablation and "SignalProfile" in bt.columns:
+                            st.warning(
+                                "Signal-ablation: **prioritera ROI / nettoresultat** i denna tabell. "
+                                "Om **FullHitRate** (alla rätt på kupongen) stiger för en profil men **ROI** sjunker jämfört med `allt_på` "
+                                "är det ofta brus — då är sannolikhetsgrenen sannolikt inte värd pengarna i denna modell."
+                            )
                         bt_numeric = bt.copy()
-                        # Simple combined score for budget recommendation.
-                        bt_numeric["Score"] = (bt_numeric["ROI"] * 0.65) + (bt_numeric["Hit12PlusRate"] * 0.35)
-                        best = bt_numeric.sort_values(["Score", "ROI"], ascending=False).iloc[0]
+                        if bt_ablation and "SignalProfile" in bt_numeric.columns:
+                            ref = bt_numeric[bt_numeric["SignalProfile"] == "allt_på"].copy()
+                            if ref.empty:
+                                ref = bt_numeric.copy()
+                        else:
+                            ref = bt_numeric.copy()
+                        ref["Score"] = (ref["ROI"] * 0.65) + (ref["Hit12PlusRate"] * 0.35)
+                        best = ref.sort_values(["Score", "ROI"], ascending=False).iloc[0]
                         st.success(
-                            f"Rekommenderad budget just nu: {int(best['BudgetRows'])} rader "
+                            f"Rekommenderad budget (baserat på profilen **allt_på**): {int(best['BudgetRows'])} rader "
                             f"med strategi `{best['Strategy']}` "
                             f"(balans mellan avkastning och chans till 12+ rätt)."
                         )
@@ -886,21 +905,29 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                             "Tolkning: högre budget ger ofta högre träffchans, men inte alltid bättre avkastning per krona."
                         )
 
-                        chart_df = (
-                            bt_numeric.groupby("BudgetRows", as_index=False)
-                            .agg({"ROI": "mean", "Hit12PlusRate": "mean"})
-                            .sort_values("BudgetRows")
-                        )
-                        st.markdown("##### Chans vs kostnad")
-                        st.line_chart(
-                            chart_df.set_index("BudgetRows")[["ROI", "Hit12PlusRate"]],
-                            use_container_width=True,
-                        )
+                        if not bt_ablation:
+                            chart_df = (
+                                bt_numeric.groupby("BudgetRows", as_index=False)
+                                .agg({"ROI": "mean", "Hit12PlusRate": "mean"})
+                                .sort_values("BudgetRows")
+                            )
+                            st.markdown("##### Chans vs kostnad")
+                            st.line_chart(
+                                chart_df.set_index("BudgetRows")[["ROI", "Hit12PlusRate"]],
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption(
+                                "Linjediagram döljs vid ablation (medel över profiler vore missvisande). "
+                                "Sortera tabellen på ROI och jämför **FullHitRate** mot ROI per SignalProfile."
+                            )
 
                         bt_show = bt.copy()
                         bt_show["ROI"] = (bt_show["ROI"] * 100).map(lambda v: f"{v:.1f}%")
                         bt_show["Hit10PlusRate"] = (bt_show["Hit10PlusRate"] * 100).map(lambda v: f"{v:.1f}%")
                         bt_show["Hit12PlusRate"] = (bt_show["Hit12PlusRate"] * 100).map(lambda v: f"{v:.1f}%")
+                        if "FullHitRate" in bt_show.columns:
+                            bt_show["FullHitRate"] = (bt_show["FullHitRate"] * 100).map(lambda v: f"{v:.2f}%")
                         st.dataframe(bt_show, use_container_width=True, hide_index=True)
     except Exception as exc:
         st.error(f"Kunde inte visa resultat: {exc}")

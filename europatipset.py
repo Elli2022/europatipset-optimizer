@@ -50,6 +50,71 @@ GAME_TYPES = {
 }
 
 
+def default_signal_backtest_profiles() -> List[Dict[str, object]]:
+    """
+    Ablationprofiler för backtest: jämför ROI mot rå träffstatistik per «signal»-gren
+    (så man inte optimerar bara 13-rätt i sim utan avkastning).
+    """
+    return [
+        {
+            "SignalProfile": "allt_på",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": True,
+            "use_volatility_probability_adjustment": True,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_form_sannolikhetsjustering",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": False,
+            "use_volatility_probability_adjustment": True,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_vol_sannolikhetsjustering",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": True,
+            "use_volatility_probability_adjustment": False,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_form_och_vol_i_sannolikheter",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": False,
+            "use_volatility_probability_adjustment": False,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_historikform_kolumner",
+            "enrich_history_form": False,
+            "use_form_probability_adjustment": True,
+            "use_volatility_probability_adjustment": True,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_fav_i_blend",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": True,
+            "use_volatility_probability_adjustment": True,
+            "include_favourites_in_blend": False,
+            "include_tio_in_blend": True,
+        },
+        {
+            "SignalProfile": "utan_tio_i_blend",
+            "enrich_history_form": True,
+            "use_form_probability_adjustment": True,
+            "use_volatility_probability_adjustment": True,
+            "include_favourites_in_blend": True,
+            "include_tio_in_blend": False,
+        },
+    ]
+
+
 def season_codes(back_years: int = 6) -> List[str]:
     # Example season code for 2025/26 is "2526"
     now = pd.Timestamp.now("UTC")
@@ -724,6 +789,10 @@ def prepare_training_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["xx"] = np.log(np.clip(out["px_raw"], 1e-6, 1))
     out["x2"] = np.log(np.clip(out["p2_raw"], 1e-6, 1))
     out["y"] = out["ftr"].map({"H": 0, "D": 1, "A": 2})
+
+    if "HomeTeam" in df.columns and "AwayTeam" in df.columns:
+        out["HomeTeam"] = df.loc[out.index, "HomeTeam"].astype(str).values
+        out["AwayTeam"] = df.loc[out.index, "AwayTeam"].astype(str).values
     return out
 
 
@@ -853,6 +922,8 @@ def blend_probability_views(
     w_streck: float = 0.23,
     w_fav: float = 0.10,
     w_tio: float = 0.05,
+    include_favourites: bool = True,
+    include_tio: bool = True,
 ) -> Tuple[float, float, float]:
     """
     Kombinerar kalibrerad odds-modell med streck, Svenska Spels «favourites»-fördelning
@@ -871,19 +942,21 @@ def blend_probability_views(
     wf_tio = float(w_tio)
 
     use_fav = (
-        fav is not None
+        include_favourites
+        and fav is not None
         and len(fav) == 3
         and all(not (isinstance(x, float) and np.isnan(x)) for x in fav)
     )
-    use_tio = (
-        tio is not None
+    use_tio_blend = (
+        include_tio
+        and tio is not None
         and len(tio) == 3
         and all(not (isinstance(x, float) and np.isnan(x)) for x in tio)
     )
     if not use_fav:
         wf_cal += wf_fav
         wf_fav = 0.0
-    if not use_tio:
+    if not use_tio_blend:
         wf_cal += wf_tio
         wf_tio = 0.0
 
@@ -896,7 +969,7 @@ def blend_probability_views(
         fv = np.clip(np.array(fav, dtype=float), 1e-9, 1.0)
         fv = fv / fv.sum()
         mix += (wf_fav / tot_w) * fv
-    if wf_tio > 0 and tio is not None:
+    if wf_tio > 0 and tio is not None and use_tio_blend:
         tv = np.clip(np.array(tio, dtype=float), 1e-9, 1.0)
         tv = tv / tv.sum()
         mix += (wf_tio / tot_w) * tv
@@ -914,6 +987,8 @@ def adjust_probs_form_and_volatility(
     form_b_pts: float,
     streck_vol: float,
     *,
+    enable_form: bool = True,
+    enable_vol: bool = True,
     form_strength: float = 0.038,
     form_scale_pts: float = 12.0,
     vol_gamma: float = 2.6,
@@ -926,7 +1001,7 @@ def adjust_probs_form_and_volatility(
     p = np.clip(np.array([p1, px, p2], dtype=float), 1e-9, 1.0)
     p = p / p.sum()
 
-    if not (np.isnan(form_h_pts) or np.isnan(form_b_pts)):
+    if enable_form and not (np.isnan(form_h_pts) or np.isnan(form_b_pts)):
         diff = float(form_h_pts) - float(form_b_pts)
         nd = float(np.clip(diff / max(form_scale_pts, 1e-6), -1.0, 1.0))
         adj = np.array([form_strength * nd, 0.0, -form_strength * nd], dtype=float)
@@ -934,7 +1009,7 @@ def adjust_probs_form_and_volatility(
         p = np.clip(p, 1e-9, 1.0)
         p = p / p.sum()
 
-    if not np.isnan(streck_vol) and streck_vol >= 0:
+    if enable_vol and not np.isnan(streck_vol) and streck_vol >= 0:
         lam = min(vol_cap, vol_gamma * float(streck_vol))
         u = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0], dtype=float)
         p = (1.0 - lam) * p + lam * u
@@ -1112,12 +1187,19 @@ def suggest_system(
     out_csv: Path,
     strategy: str = "balanced",
     game_type: str = "europatipset",
+    *,
+    enrich_history_form: bool = True,
+    use_form_probability_adjustment: bool = True,
+    use_volatility_probability_adjustment: bool = True,
+    include_favourites_in_blend: bool = True,
+    include_tio_in_blend: bool = True,
 ) -> pd.DataFrame:
     with open(model_file, "rb") as f:
         model = pickle.load(f)
 
     coupon = enforce_game_type(parse_coupon(coupon_csv), game_type=game_type)
-    coupon = enrich_coupon_with_history_form(coupon, coupon_csv)
+    if enrich_history_form:
+        coupon = enrich_coupon_with_history_form(coupon, coupon_csv)
     coupon = add_streck_volatility_column(coupon)
     matches: List[MatchSuggestion] = []
 
@@ -1142,6 +1224,8 @@ def suggest_system(
             streck_trip,
             fav_trip,
             tio_trip,
+            include_favourites=include_favourites_in_blend,
+            include_tio=include_tio_in_blend,
         )
         try:
             fh = float(row["FormH_pts5"])
@@ -1155,7 +1239,16 @@ def suggest_system(
             sv = float(row["StreckVol"])
         except Exception:
             sv = float("nan")
-        p1, px, p2 = adjust_probs_form_and_volatility(p1, px, p2, fh, fb, sv)
+        p1, px, p2 = adjust_probs_form_and_volatility(
+            p1,
+            px,
+            p2,
+            fh,
+            fb,
+            sv,
+            enable_form=use_form_probability_adjustment,
+            enable_vol=use_volatility_probability_adjustment,
+        )
         m = MatchSuggestion(
             match=str(row["Match"]),
             odd1=float(row["Odd1"]),
@@ -1198,7 +1291,16 @@ def backtest_strategies(
     game_type: str = "europatipset",
     n_coupons: int = 50,
     seed: int = 7,
+    *,
+    compare_signal_profiles: bool = False,
 ) -> pd.DataFrame:
+    """
+    Historiskt skiss-backtest på slumpade «kuponger» ur odds-historik.
+
+    Sätt ``compare_signal_profiles=True`` för att köra samma sweep per signal-ablation
+    (form-/vol-justering, historikberikning, fav/tio i blend).     Jämför då **ROI** mot **FullHitRate** (andel kuponger där bästa raden får alla matcher rätt) —
+    högre «fullträff»-andel utan högre ROI är ofta brus / överanpassning.
+    """
     if not history_csv.exists() or history_csv.stat().st_size == 0:
         raise RuntimeError("Historikfil saknas eller är tom för backtest.")
     df = pd.read_csv(history_csv, low_memory=False)
@@ -1216,80 +1318,127 @@ def backtest_strategies(
     if not chunks:
         raise RuntimeError("För lite historik för backtest.")
 
-    results = []
-    for budget in budgets:
-        for strategy in strategies:
-            total_cost = 0.0
-            total_return = 0.0
-            rights_counter: Counter = Counter()
+    profile_defs = default_signal_backtest_profiles()
+    if not compare_signal_profiles:
+        profile_defs = [profile_defs[0]]
 
-            for chunk in chunks:
-                coupon = pd.DataFrame(
-                    {
-                        "Match": [f"M{i+1}" for i in range(match_count)],
-                        "Odd1": chunk["odd1"].to_numpy(),
-                        "OddX": chunk["oddx"].to_numpy(),
-                        "Odd2": chunk["odd2"].to_numpy(),
+    results: List[Dict[str, object]] = []
+    for profile in profile_defs:
+        prof_name = str(profile["SignalProfile"])
+        enrich_hist = bool(profile["enrich_history_form"])
+        use_form_adj = bool(profile["use_form_probability_adjustment"])
+        use_vol_adj = bool(profile["use_volatility_probability_adjustment"])
+        incl_fav = bool(profile["include_favourites_in_blend"])
+        incl_tio = bool(profile["include_tio_in_blend"])
+
+        for budget in budgets:
+            for strategy in strategies:
+                total_cost = 0.0
+                total_return = 0.0
+                rights_counter: Counter = Counter()
+
+                for chunk in chunks:
+                    names: List[str] = []
+                    for i in range(match_count):
+                        ht = chunk.iloc[i].get("HomeTeam") if "HomeTeam" in chunk.columns else None
+                        at = chunk.iloc[i].get("AwayTeam") if "AwayTeam" in chunk.columns else None
+                        if ht is not None and at is not None:
+                            hs = str(ht).strip()
+                            ass = str(at).strip()
+                            if hs and ass:
+                                names.append(f"{hs} - {ass}")
+                                continue
+                        names.append(f"M{i+1}")
+
+                    coupon = pd.DataFrame(
+                        {
+                            "Match": names,
+                            "Odd1": chunk["odd1"].to_numpy(),
+                            "OddX": chunk["oddx"].to_numpy(),
+                            "Odd2": chunk["odd2"].to_numpy(),
+                        }
+                    )
+                    inv = 1 / coupon[["Odd1", "OddX", "Odd2"]].to_numpy()
+                    p_hat = inv / inv.sum(axis=1, keepdims=True)
+                    prev_streck = np.clip(p_hat + rng.normal(0, 0.055, size=p_hat.shape), 0.02, 0.98)
+                    prev_streck /= prev_streck.sum(axis=1, keepdims=True)
+                    curr_streck = np.clip(p_hat + rng.normal(0, 0.038, size=p_hat.shape), 0.02, 0.98)
+                    curr_streck /= curr_streck.sum(axis=1, keepdims=True)
+                    coupon["Streck1"] = curr_streck[:, 0]
+                    coupon["StreckX"] = curr_streck[:, 1]
+                    coupon["Streck2"] = curr_streck[:, 2]
+                    coupon["StreckMv1"] = curr_streck[:, 0] - prev_streck[:, 0]
+                    coupon["StreckMvX"] = curr_streck[:, 1] - prev_streck[:, 1]
+                    coupon["StreckMv2"] = curr_streck[:, 2] - prev_streck[:, 2]
+
+                    shock = rng.uniform(0.94, 1.06, size=(match_count, 3))
+                    start_odds = coupon[["Odd1", "OddX", "Odd2"]].to_numpy(dtype=float) * shock
+                    curr_odds = coupon[["Odd1", "OddX", "Odd2"]].to_numpy(dtype=float)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        odd_mv = (curr_odds - start_odds) / np.maximum(start_odds, 1.02)
+                    coupon["OddMv1"] = odd_mv[:, 0]
+                    coupon["OddMvX"] = odd_mv[:, 1]
+                    coupon["OddMv2"] = odd_mv[:, 2]
+
+                    tmp_coupon = history_csv.parent / "_tmp_backtest_coupon.csv"
+                    tmp_out = history_csv.parent / "_tmp_backtest_out.csv"
+                    coupon.to_csv(tmp_coupon, index=False)
+                    out = suggest_system(
+                        coupon_csv=tmp_coupon,
+                        model_file=model_file,
+                        max_rows=int(budget),
+                        out_csv=tmp_out,
+                        strategy=strategy,
+                        game_type=game_type,
+                        enrich_history_form=enrich_hist,
+                        use_form_probability_adjustment=use_form_adj,
+                        use_volatility_probability_adjustment=use_vol_adj,
+                        include_favourites_in_blend=incl_fav,
+                        include_tio_in_blend=incl_tio,
+                    )
+
+                    picks = out["Förslag"].tolist()
+                    rows_matrix = expand_system_rows(picks)
+                    actual = chunk["y"].to_numpy(dtype=int)
+                    hits = (rows_matrix == actual).sum(axis=1)
+                    max_hit = int(hits.max())
+                    rights_counter[max_hit] += 1
+
+                    base_pool = float(budget) * 1500.0
+                    upset_level = float(np.mean(1.0 - curr_streck[np.arange(match_count), actual]))
+                    payout_map = {
+                        10: base_pool * 0.02 * (1 + upset_level * 1.2),
+                        11: base_pool * 0.09 * (1 + upset_level * 1.8),
+                        12: base_pool * 0.25 * (1 + upset_level * 2.4),
+                        13: base_pool * 0.64 * (1 + upset_level * 3.2),
                     }
-                )
-                inv = 1 / coupon[["Odd1", "OddX", "Odd2"]].to_numpy()
-                p = inv / inv.sum(axis=1, keepdims=True)
-                noisy = np.clip(p + rng.normal(0, 0.04, size=p.shape), 0.01, 0.98)
-                noisy = noisy / noisy.sum(axis=1, keepdims=True)
-                coupon["Streck1"] = noisy[:, 0]
-                coupon["StreckX"] = noisy[:, 1]
-                coupon["Streck2"] = noisy[:, 2]
+                    payout = payout_map.get(max_hit, 0.0)
+                    rows = int(out["Systemrader"].iloc[0])
+                    cost = rows * row_price
+                    total_cost += cost
+                    total_return += payout
 
-                tmp_coupon = history_csv.parent / "_tmp_backtest_coupon.csv"
-                tmp_out = history_csv.parent / "_tmp_backtest_out.csv"
-                coupon.to_csv(tmp_coupon, index=False)
-                out = suggest_system(
-                    coupon_csv=tmp_coupon,
-                    model_file=model_file,
-                    max_rows=int(budget),
-                    out_csv=tmp_out,
-                    strategy=strategy,
-                    game_type=game_type,
-                )
-
-                picks = out["Förslag"].tolist()
-                rows_matrix = expand_system_rows(picks)
-                actual = chunk["y"].to_numpy(dtype=int)
-                hits = (rows_matrix == actual).sum(axis=1)
-                max_hit = int(hits.max())
-                rights_counter[max_hit] += 1
-
-                # More realistic payout: depends on upset level and total pool.
-                # Higher upset level -> fewer winners -> higher payout.
-                base_pool = float(budget) * 1500.0
-                upset_level = float(np.mean(1.0 - noisy[np.arange(match_count), actual]))
-                payout_map = {
-                    10: base_pool * 0.02 * (1 + upset_level * 1.2),
-                    11: base_pool * 0.09 * (1 + upset_level * 1.8),
-                    12: base_pool * 0.25 * (1 + upset_level * 2.4),
-                    13: base_pool * 0.64 * (1 + upset_level * 3.2),
-                }
-                payout = payout_map.get(max_hit, 0.0)
-                rows = int(out["Systemrader"].iloc[0])
-                cost = rows * row_price
-                total_cost += cost
-                total_return += payout
-
-            roi = (total_return - total_cost) / total_cost if total_cost > 0 else 0.0
-            results.append(
-                {
+                n_ch = len(chunks)
+                roi = (total_return - total_cost) / total_cost if total_cost > 0 else 0.0
+                row: Dict[str, object] = {
                     "GameType": game_type,
                     "Strategy": strategy,
                     "BudgetRows": int(budget),
-                    "CouponsTested": len(chunks),
+                    "CouponsTested": n_ch,
                     "ROI": roi,
-                    "AvgReturnPerCoupon": total_return / max(1, len(chunks)),
-                    "Hit10PlusRate": sum(v for k, v in rights_counter.items() if k >= 10) / max(1, len(chunks)),
-                    "Hit12PlusRate": sum(v for k, v in rights_counter.items() if k >= 12) / max(1, len(chunks)),
+                    "AvgReturnPerCoupon": total_return / max(1, n_ch),
+                    "Hit10PlusRate": sum(v for k, v in rights_counter.items() if k >= 10) / max(1, n_ch),
+                    "Hit12PlusRate": sum(v for k, v in rights_counter.items() if k >= 12) / max(1, n_ch),
+                    "FullHitRate": float(rights_counter.get(match_count, 0)) / max(1, n_ch),
                 }
-            )
+                if compare_signal_profiles:
+                    row["SignalProfile"] = prof_name
+                results.append(row)
 
-    return pd.DataFrame(results).sort_values(["ROI", "Hit12PlusRate"], ascending=False)
+    out_df = pd.DataFrame(results)
+    if compare_signal_profiles:
+        return out_df.sort_values(["Strategy", "BudgetRows", "SignalProfile"], ascending=True).reset_index(drop=True)
+    return out_df.sort_values(["ROI", "Hit12PlusRate"], ascending=False).reset_index(drop=True)
 
 
 def main():
@@ -1345,6 +1494,11 @@ def main():
     bt.add_argument("--strategies", default="balanced,safe,value")
     bt.add_argument("--game-type", choices=list(GAME_TYPES.keys()), default="europatipset")
     bt.add_argument("--n-coupons", type=int, default=50)
+    bt.add_argument(
+        "--signal-ablation",
+        action="store_true",
+        help="Kör backtest per signal-profil (form/vol/fav/tio) och rapportera bl.a. FullHitRate vs ROI.",
+    )
 
     args = parser.parse_args()
 
@@ -1401,6 +1555,7 @@ def main():
             strategies=strategies,
             game_type=args.game_type,
             n_coupons=args.n_coupons,
+            compare_signal_profiles=bool(args.signal_ablation),
         )
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(args.out, index=False)
