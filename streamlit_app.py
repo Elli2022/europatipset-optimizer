@@ -10,7 +10,6 @@ import streamlit as st
 from europatipset import (
     GAME_TYPES,
     assess_forecast_confidence,
-    auto_refresh_official_snapshot,
     backtest_strategies,
     download_historical_data,
     fetch_official_coupon_state,
@@ -18,8 +17,17 @@ from europatipset import (
     simulate_rights_distribution,
     suggest_system,
     sync_history_from_free_api,
+    sync_official_snapshot_smart,
     train_model,
     validate_coupon_data,
+)
+from play_journal import (
+    add_pending_bet,
+    append_outcomes_training_rows,
+    default_journal_path,
+    learning_hint,
+    load_journal,
+    settle_bet,
 )
 
 
@@ -33,6 +41,8 @@ RECOMMENDATION_PATH = OUTPUT_DIR / "recommendation_official.csv"
 API_HISTORY_PATH = DATA_DIR / "raw" / "history_api.csv"
 OFFICIAL_META_PATH = INPUT_DIR / "official_meta.json"
 HISTORY_CSV = DATA_DIR / "raw" / "history.csv"
+USER_DATA_DIR = DATA_DIR / "user"
+JOURNAL_PATH = default_journal_path(BASE_DIR)
 
 
 def _inject_streamlit_secrets_into_env() -> None:
@@ -162,7 +172,11 @@ def _last_hour_warning(meta: dict) -> None:
     if hours_left is None:
         return
     if hours_left <= 0:
-        st.error("Spelstopp verkar ha passerat för aktuell omgång.")
+        st.info(
+            "Spelstopp har passerat för den omgång som visas i metadata just nu. "
+            "Appen synkar automatiskt nästa öppna omgång enligt intervall — "
+            "tryck **Hämta officiell kupong och beräkna förslag** om datum och matcher inte uppdaterats än."
+        )
         return
     minutes_left = int(hours_left * 60)
     if minutes_left <= 15:
@@ -204,6 +218,100 @@ def _risk_level(confidence_label: str, warning_count: int) -> tuple[str, str, st
     return ("GUL", "#ca8a04", "Viss osäkerhet - spela mer försiktigt.")
 
 
+def _render_my_spel_page() -> None:
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    st.subheader("Mina spel")
+    st.caption(
+        "Spara kupong och förslag innan du lägger spelet. Efter rättning kan du ange "
+        "13-teckensrad (1/X/2) för enkel miss-analys. Data lagras under `data/user/` på denna instans."
+    )
+    st.warning(
+        "Streamlit Community Cloud har ofta tillfällig disk — journalen kan försvinna vid omstart. "
+        "Exportera JSON nedan om du vill behålla historiken."
+    )
+
+    data = load_journal(JOURNAL_PATH)
+    pending = [b for b in data["bets"] if b.get("status") == "pending"]
+    settled = [b for b in data["bets"] if b.get("status") == "settled"]
+
+    raw_json = json.dumps(data, ensure_ascii=False, indent=2)
+    st.download_button(
+        "Exportera spellogg (JSON)",
+        data=raw_json.encode("utf-8"),
+        file_name="play_journal_export.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    ej_tab, rt_tab = st.tabs(["Ej rättade", "Rättade"])
+    with ej_tab:
+        if not pending:
+            st.info(
+                "Inga osparade kuponger. Under **Analyser** → fliken **Systemförslag**, "
+                "tryck **Spara till Mina spel** efter du hämtat kupongen."
+            )
+        for bet in pending:
+            title = f"{bet.get('draw_comment', 'Omgång')} · rader {bet.get('system_rows', '-')}"
+            with st.expander(title, expanded=False):
+                st.caption(f"ID `{bet['id']}` · spelstopp `{bet.get('reg_close_time', '-')}`")
+                rec_rows = bet.get("recommendation_rows") or []
+                if rec_rows:
+                    cols = [c for c in ["Match", "Förslag", "P1", "PX", "P2"] if c in rec_rows[0]]
+                    st.dataframe(
+                        pd.DataFrame(rec_rows)[cols],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                hits_best = st.number_input(
+                    "Bästa rad — antal rätt (0–13)",
+                    min_value=0,
+                    max_value=13,
+                    value=0,
+                    key=f"hits_{bet['id']}",
+                )
+                outcomes = st.text_input(
+                    "Valfritt: rätt rad, exakt 13 tecken (1, X, 2)",
+                    max_chars=13,
+                    key=f"out_{bet['id']}",
+                    placeholder="t.ex. 1X212X1212122",
+                )
+                if st.button("Spara rättning", key=f"settle_{bet['id']}", type="primary"):
+                    o = outcomes.strip().replace(" ", "").upper() if outcomes.strip() else ""
+                    try:
+                        settle_bet(
+                            JOURNAL_PATH,
+                            bet["id"],
+                            int(hits_best),
+                            o if len(o) == 13 else None,
+                        )
+                        if len(o) == 13 and rec_rows:
+                            append_outcomes_training_rows(BASE_DIR, rec_rows, o)
+                        st.success("Rättning sparad.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+    with rt_tab:
+        if not settled:
+            st.info("Inga rättade spel ännu.")
+        else:
+            rows_out = []
+            for bet in settled:
+                ins = bet.get("insights") or {}
+                rows_out.append(
+                    {
+                        "Omgång": bet.get("draw_comment", ""),
+                        "Rätt antal (bästa rad)": ins.get("hits_best_row", ""),
+                        "Täckning kolumner": ins.get("column_coverage", ""),
+                        "Datum": bet.get("settled_at", ""),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows_out), use_container_width=True, hide_index=True)
+            with st.expander("Detaljer — senaste rättade"):
+                bet = settled[0]
+                st.json(bet)
+
+
 st.set_page_config(page_title="Europatipset Optimizer", page_icon="⚽", layout="wide")
 _inject_streamlit_secrets_into_env()
 
@@ -228,6 +336,14 @@ if not MODEL_PATH.exists():
             "lägg sedan till filen `data/models/calibration.pkl` i repot och pusha — eller försök deploy igen."
         )
         st.stop()
+
+with st.sidebar:
+    page_section = st.radio("Sektion", ["Analyser", "Mina spel"], index=0)
+
+if page_section == "Mina spel":
+    st.title("Mina spel")
+    _render_my_spel_page()
+    st.stop()
 
 st.title("Europatipset Optimizer")
 st.caption("Användarvänligt stöd för att välja tecken med sannolikhet, streckvärde och scenarios.")
@@ -272,7 +388,14 @@ with st.sidebar:
         default=[32, 64, 128],
     )
     days_back = st.slider("API-historik (dagar bakåt)", min_value=30, max_value=365, value=120, step=10)
-    auto_turnover_refresh = st.toggle("Auto-hämta omsättning från Svenska Spel", value=True)
+    auto_turnover_refresh = st.toggle(
+        "Auto-synka officiell kupong (Svenska Spel, smart intervall)", value=True
+    )
+    _journal_for_hint = load_journal(JOURNAL_PATH)
+    _agg = _journal_for_hint.get("aggregate") or {}
+    if int(_agg.get("settled_rounds", 0)) >= 1:
+        st.markdown("##### Lärdom från Mina spel")
+        st.markdown(learning_hint(_journal_for_hint))
     if st.button("Synka API-historik nu", use_container_width=True):
         if not os.getenv("FOOTBALL_DATA_API_KEY"):
             st.error("Saknar FOOTBALL_DATA_API_KEY. Lägg till i miljövariabler/Streamlit Secrets.")
@@ -289,22 +412,29 @@ st.info(f"{status_line}  |  {status_detail}")
 cached_meta = _load_cached_meta()
 if auto_turnover_refresh:
     try:
-        # Try often, but the refresh function throttles writes and avoids excess calls.
-        did_refresh, _ = auto_refresh_official_snapshot(
+        sync_official_snapshot_smart(
             out_coupon_csv=OFFICIAL_COUPON_PATH,
             out_meta_json=OFFICIAL_META_PATH,
-            hours_before_close=24,
-            min_interval_minutes=15,
+            min_interval_minutes=12.0,
         )
-        if did_refresh:
-            cached_meta = _load_cached_meta()
     except Exception:
         pass
+cached_meta = _load_cached_meta()
 
 if cached_meta:
     _last_hour_warning(cached_meta)
 
 st.write("1) Hämta officiell kupong  2) Välj strategi/budget  3) Analysera och exportera")
+
+with st.expander("Om modellen — vad som ingår (och inte)"):
+    st.markdown(
+        """
+Förslagen bygger på **matchodds**, **streckfördelning**, **historisk kalibrering** mot din nedladdade historik
+och **Monte Carlo-simulering** av täckning — inte på skador, elvor eller nyhetsflöden såvida du inte matar in sådan data själv.
+
+Det betyder att modellen kan missa när oddsen inte hunnit reagera på sent besked; använd sunda marginaler och egen matchkunskap vid osäkerhet.
+        """
+    )
 
 if "coupon_df" not in st.session_state:
     st.session_state["coupon_df"] = None
@@ -395,6 +525,19 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         st.dataframe(formatted, use_container_width=True, hide_index=True)
                     st.metric("Systemrader", int(result_df["Systemrader"].iloc[0]))
                     st.caption(f"Strategi: {st.session_state.get('strategy', 'balanced')}")
+                    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                    if st.button("Spara till Mina spel", key="save_play_journal", use_container_width=True):
+                        bid = add_pending_bet(
+                            JOURNAL_PATH,
+                            meta,
+                            coupon_df,
+                            result_df,
+                            int(result_df["Systemrader"].iloc[0]),
+                            "",
+                        )
+                        st.success(
+                            f"Sparat som `{bid}`. Byt till **Mina spel** i sidopanelen för att rätta efter omgången."
+                        )
 
                 with tab2:
                     analysis = result_df.copy()

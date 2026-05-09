@@ -50,7 +50,7 @@ Lägg till rad:
 0 6 * * * /Users/elli/europatipset-optimizer/scripts/sync_history.sh >> /Users/elli/europatipset-optimizer/data/sync.log 2>&1
 ```
 
-Auto-refresh inför spelstopp (uppdaterar omsättning/kupong nära spelstopp):
+Smart synk av officiell kupong (ny omgång direkt när `draw_number` ändrats, annars högst var 15:e minut):
 
 ```bash
 chmod +x scripts/refresh_before_stop.sh
@@ -63,7 +63,16 @@ Lägg till rad (var 15:e minut):
 */15 * * * * /Users/elli/europatipset-optimizer/scripts/refresh_before_stop.sh >> /Users/elli/europatipset-optimizer/data/refresh.log 2>&1
 ```
 
-Scriptet uppdaterar bara när det är nära spelstopp (default: inom 2 timmar).
+CLI motsvarighet:
+
+```bash
+python europatipset.py sync-official-smart \
+  --coupon-out data/input/official_coupon.csv \
+  --meta-out data/input/official_meta.json \
+  --min-interval-minutes 15
+```
+
+Kommandot `auto-refresh-official` finns kvar om du uttryckligen vill begränsa uppdateringar till fönstret nära spelstopp.
 
 ## 2) Träna modell
 
@@ -129,6 +138,9 @@ I UI:t kan du:
 - se prognoskonfidens (hög/medel/låg)
 - köra historiskt backtest (ROI + träffnivåer)
 - välja omgångstyp (`europatipset`/`topptipset`)
+- spara spelade kuponger under **Mina spel**, rätta med antal rätt och valfri 13-teckensrad för enkel lärdom
+
+**Streamlit Cloud:** disk på gratisnivå är ofta **tillfällig** — filer under `data/user/` (spelloggen) kan försvinna vid omstart. Använd **Exportera spellogg** i **Mina spel** om du vill behålla historiken.
 
 ## Deploy
 

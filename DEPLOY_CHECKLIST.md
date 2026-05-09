@@ -47,3 +47,7 @@ BOOTSTRAP_HISTORY_YEARS = "3"
 
 - If sync fails, confirm API key is valid and free-tier quota is not exhausted
 - Reboot app after major dependency updates
+
+## 6) Ephemeral disk (Mina spel)
+
+Spelloggen (`data/user/play_journal.json`) sparas på serverns lokala disk. På Streamlit Community Cloud kan den **nollställas** vid cold start eller omstart. Använd **Exportera spellogg (JSON)** i appen om du behöver beständighet, eller kör verktyget lokalt med committad/backupad `data/user/`.

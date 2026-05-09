@@ -368,8 +368,6 @@ def auto_refresh_official_snapshot(
     hours_left = (close_dt - now_utc).total_seconds() / 3600.0
     if hours_left > float(hours_before_close):
         return False, f"För tidigt för refresh ({hours_left:.2f}h kvar till spelstopp)."
-    if hours_left < -1:
-        return False, "Omgången verkar ha stängt."
 
     if out_meta_json.exists():
         try:
@@ -393,6 +391,51 @@ def auto_refresh_official_snapshot(
     }
     out_meta_json.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
     return True, "Refresh genomförd."
+
+
+def sync_official_snapshot_smart(
+    out_coupon_csv: Path,
+    out_meta_json: Path,
+    min_interval_minutes: float = 10.0,
+) -> Tuple[bool, str]:
+    """
+    Synka officiell kupong/meta till disk utan att fastna på gamla omgångar.
+
+    Uppdaterar alltid direkt om draw_number ändrats (ny öppen omgång).
+    Annars throttle för att inte överbelasta Svenska Spel.
+    """
+    coupon_df, meta = fetch_official_coupon_state()
+    now_utc = pd.Timestamp.now("UTC")
+    old_draw = None
+    last_refresh = None
+    if out_meta_json.exists():
+        try:
+            old = json.loads(out_meta_json.read_text(encoding="utf-8"))
+            old_draw = str(old.get("draw_number", "") or "")
+            last_refresh = pd.to_datetime(old.get("last_refresh_utc"), utc=True, errors="coerce")
+        except Exception:
+            pass
+
+    new_draw = str(meta.get("draw_number", "") or "")
+    draw_changed = bool(old_draw) and old_draw != new_draw
+
+    mins_since = float("inf")
+    if pd.notna(last_refresh):
+        mins_since = (now_utc - last_refresh).total_seconds() / 60.0
+
+    first_run = not old_draw
+    should_refresh = first_run or draw_changed or mins_since >= float(min_interval_minutes)
+
+    if not should_refresh:
+        return False, f"Synk nyligen ({mins_since:.1f} min sedan)."
+
+    out_coupon_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_meta_json.parent.mkdir(parents=True, exist_ok=True)
+    coupon_df.to_csv(out_coupon_csv, index=False)
+    meta_out = {**meta, "last_refresh_utc": now_utc.isoformat()}
+    out_meta_json.write_text(json.dumps(meta_out, ensure_ascii=False, indent=2), encoding="utf-8")
+    msg = "Ny omgång hämtad." if draw_changed else "Omgång uppdaterad."
+    return True, msg
 
 
 def download_official_coupon_from_svenskaspel(out_file: Path) -> pd.DataFrame:
@@ -886,6 +929,14 @@ def main():
     ar.add_argument("--hours-before-close", type=int, default=2)
     ar.add_argument("--min-interval-minutes", type=int, default=15)
 
+    ss = sub.add_parser(
+        "sync-official-smart",
+        help="Synka officiell kupong (ny omgång direkt, annars throttle)",
+    )
+    ss.add_argument("--coupon-out", default="data/input/official_coupon.csv")
+    ss.add_argument("--meta-out", default="data/input/official_meta.json")
+    ss.add_argument("--min-interval-minutes", type=float, default=12.0)
+
     bt = sub.add_parser("backtest", help="Kör historiskt backtest för strategier/budgetar")
     bt.add_argument("--history", default="data/raw/history.csv")
     bt.add_argument("--model", default="data/models/calibration.pkl")
@@ -933,6 +984,13 @@ def main():
             min_interval_minutes=args.min_interval_minutes,
         )
         print(f"Auto-refresh: {'JA' if changed else 'NEJ'} - {message}")
+    elif args.cmd == "sync-official-smart":
+        changed, message = sync_official_snapshot_smart(
+            out_coupon_csv=Path(args.coupon_out),
+            out_meta_json=Path(args.meta_out),
+            min_interval_minutes=args.min_interval_minutes,
+        )
+        print(f"Smart-sync: {'JA' if changed else 'NEJ'} - {message}")
     elif args.cmd == "backtest":
         budgets = [int(x.strip()) for x in args.budgets.split(",") if x.strip()]
         strategies = [x.strip() for x in args.strategies.split(",") if x.strip()]
