@@ -7,6 +7,7 @@ data/models/
 data/output/
 data/input/
 data/user/
+data/cache/
 
 svenskaspel_statistik.html
 .env

@@ -22,6 +22,7 @@ from europatipset import (
     train_model,
     validate_coupon_data,
 )
+from free_context import build_free_context_for_coupon
 from journal_browser_sync import ensure_journal_merged_once_session, sync_journal_to_browser
 from play_journal import (
     add_pending_bet,
@@ -45,6 +46,19 @@ OFFICIAL_META_PATH = INPUT_DIR / "official_meta.json"
 HISTORY_CSV = DATA_DIR / "raw" / "history.csv"
 USER_DATA_DIR = DATA_DIR / "user"
 JOURNAL_PATH = default_journal_path(BASE_DIR)
+FD_STANDINGS_CACHE = DATA_DIR / "cache" / "fd_standings_free.json"
+
+CTX_COLUMN_LABELS = {
+    "Ctx_liga": "FD-liga",
+    "Ctx_match_conf": "Namn-match",
+    "Ctx_h_pos": "H tab",
+    "Ctx_b_pos": "B tab",
+    "Ctx_poängdiff": "Poäng Δ(H−B)",
+    "Ctx_plac_diff": "Plac Δ (+ för hem)",
+    "Ctx_form_H": "Form hem",
+    "Ctx_form_B": "Form borta",
+    "Ctx_tabell": "Tabell (gratis)",
+}
 
 
 def _inject_streamlit_secrets_into_env() -> None:
@@ -575,6 +589,15 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         )
 
                 with tab2:
+                    st.markdown(
+                        "#### Matchanalys — gratis ligatabell + form"
+                        "\n\n"
+                        "Här visas **ligatabell** (football-data.org free, cache ~12 h) och **form** "
+                        "från din synkade **API-historik** när den finns. "
+                        "Det är **inte** skador eller officiella elvor — bara kontext som ofta korrelerar "
+                        "med styrkeförhållanden i de åtta gratisligorna (PL, La Liga, Serie A, … — "
+                        "se `free_context.py`). Kupongmatcher utanför dessa ligor lämnas tomma i tabellkolumnerna."
+                    )
                     analysis = result_df.copy()
                     analysis["Troligaste tecken"] = analysis[["P1", "PX", "P2"]].idxmax(axis=1).map(
                         {"P1": "1", "PX": "X", "P2": "2"}
@@ -585,8 +608,19 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                     analysis_view = analysis[
                         ["Match", "Troligaste tecken", "Bäst värde", "Förslag", "P1", "PX", "P2"]
                     ]
+                    hist_path = API_HISTORY_PATH if API_HISTORY_PATH.exists() else None
+                    ctx_df, ctx_note = build_free_context_for_coupon(
+                        coupon_df,
+                        os.getenv("FOOTBALL_DATA_API_KEY"),
+                        hist_path,
+                        FD_STANDINGS_CACHE,
+                        ttl_hours=12.0,
+                    )
+                    ctx_show = ctx_df.rename(columns=CTX_COLUMN_LABELS)
+                    analysis_disp = pd.concat([analysis_view, ctx_show], axis=1)
+                    st.caption(ctx_note)
                     if mobile_mode:
-                        for _, row in analysis_view.iterrows():
+                        for _, row in analysis_disp.iterrows():
                             with st.expander(row["Match"]):
                                 st.write(f"Troligaste tecken: **{row['Troligaste tecken']}**")
                                 st.write(f"Bäst värde: **{row['Bäst värde']}**")
@@ -594,9 +628,17 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                                 st.write(
                                     f"Sannolikhet 1/X/2: {row['P1']:.3f} / {row['PX']:.3f} / {row['P2']:.3f}"
                                 )
+                                st.divider()
+                                st.markdown("**Gratis tabell/form:**")
+                                for _, lab in CTX_COLUMN_LABELS.items():
+                                    if lab in row.index:
+                                        val = row[lab]
+                                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                                            val = "-"
+                                        st.caption(f"{lab}: {val}")
                     else:
                         st.dataframe(
-                            analysis_view,
+                            analysis_disp,
                             use_container_width=True,
                             hide_index=True,
                         )

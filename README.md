@@ -138,6 +138,7 @@ I UI:t kan du:
 - se prognoskonfidens (hög/medel/låg)
 - köra historiskt backtest (ROI + träffnivåer)
 - välja omgångstyp (`europatipset`/`topptipset`)
+- i **Matchanalys**: gratis **ligatabell + form** för matcher som går att koppla till football-data.orgs free-tier ligor (via API-nyckel), kompletterat med form från lokal API-historik — inte skador/elvor
 - spara spelade kuponger under **Mina spel**, rätta med antal rätt och valfri 13-teckensrad för enkel lärdom
 
 **Streamlit Cloud:** serverdisk kan vara **tillfällig**, men **Mina spel** speglas automatiskt till din webbläsares **localStorage** (ingen JSON-export krävs i normalfallet). Byter du webbläsare eller rensar du sajtdatum kan historiken ändå försvinna — då är JSON-export en bra backup.
