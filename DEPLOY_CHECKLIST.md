@@ -37,7 +37,7 @@ BOOTSTRAP_HISTORY_YEARS = "3"
 
 ## 4) Post-deploy smoke tests
 
-- Open app URL — första gången kan sidan visa spinner **1–4 min** medan modellen tränas
+- Open app URL: **https://europatipset-optimizer.streamlit.app** — första gången kan sidan visa spinner **1–4 min** medan modellen tränas
 - Click `Synka API-historik nu`
 - Click `Hämta officiell kupong och beräkna förslag`
 - Verify week/day/date header appears

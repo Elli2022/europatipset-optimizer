@@ -1,0 +1,104 @@
+{
+  "round_id": "europatipset_v2026-22",
+  "outcomes_13": "121212122X211",
+  "played_column_coverage": 8,
+  "reference_safe_coverage": 9,
+  "hits_best_row_played": 8,
+  "payout_threshold": 10,
+  "payout_kr": 0,
+  "misses_played": [
+    {
+      "match": "AIK - Häcken",
+      "pick": "2",
+      "outcome": "1",
+      "reference_pick": "2"
+    },
+    {
+      "match": "Club Libertad Asunción - UCV FC",
+      "pick": "1",
+      "outcome": "2",
+      "reference_pick": "1X2"
+    },
+    {
+      "match": "Corinthians - Platense",
+      "pick": "1",
+      "outcome": "2",
+      "reference_pick": "1X"
+    },
+    {
+      "match": "CA Peñarol - Santa Fe",
+      "pick": "1",
+      "outcome": "2",
+      "reference_pick": "2"
+    },
+    {
+      "match": "Cienciano - Juventud de Las Piedras",
+      "pick": "1",
+      "outcome": "X",
+      "reference_pick": "1"
+    }
+  ],
+  "misses_reference_safe": [
+    {
+      "match": "Club Bolívar - Independiente Rivadavia",
+      "reference_pick": "1",
+      "outcome": "2"
+    },
+    {
+      "match": "Cienciano - Juventud de Las Piedras",
+      "reference_pick": "1",
+      "outcome": "X"
+    }
+  ],
+  "headline_lessons": [
+    "8 kolumner rätt ger 0 kr — Europatipset betalar från 10 rätt på en rad.",
+    "Smala spikar (AIK–Häcken 2, Libertad 1, Corinthians 1, Peñarol 1, Cienciano 1) kostade utdelning.",
+    "Halvgarderingar på osäkra cup-/gruppspelsmatcher hade gett 9/13 kolumn-täckning i referensraden (fortfarande under 10-rättsgränsen om spikarna missar).",
+    "Modellen ska prioritera sannolikhet för ≥10 rätt på bästa rad, inte bara flest rätta tecken totalt."
+  ],
+  "played_picks": [
+    "1X2",
+    "2",
+    "2",
+    "1",
+    "1X",
+    "2",
+    "1",
+    "1",
+    "1",
+    "X2",
+    "1",
+    "1",
+    "1"
+  ],
+  "reference_safe_picks": [
+    "1",
+    "2",
+    "2",
+    "1X2",
+    "1",
+    "1",
+    "1X",
+    "2",
+    "1",
+    "1X2",
+    "1",
+    "1X2",
+    "1"
+  ],
+  "matches": [
+    "Crystal Palace - Rayo Vallecano",
+    "AIK - Häcken",
+    "Eskilstuna - Hammarby",
+    "Club Libertad Asunción - UCV FC",
+    "CSD Independiente del Valle - Rosario",
+    "Club Bolívar - Independiente Rivadavia",
+    "Corinthians - Platense",
+    "CA Peñarol - Santa Fe",
+    "Atletico Mineiro - Academia Puerto Cabello",
+    "Caracas FC - Botafogo RJ",
+    "Cienciano - Juventud de Las Piedras",
+    "Club Olimpia Asunción - Audax Italiano",
+    "Vasco da Gama - Barracas Central"
+  ]
+}
