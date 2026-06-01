@@ -50,6 +50,8 @@ def _empty_aggregate() -> Dict[str, Any]:
         "miss_on_single_pick": 0,
         "miss_on_single_favorite": 0,
         "miss_on_single_underdog": 0,
+        "column_vs_payout_gap_events": 0,
+        "below_payout_threshold_events": 0,
     }
 
 
@@ -60,10 +62,14 @@ def rebuild_aggregate_from_bets(bets: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         ins = bet.get("insights") or {}
         misses = ins.get("misses_detail")
-        if not misses:
+        if not misses and not ins.get("hits_best_row"):
             continue
         agg["settled_rounds"] = int(agg["settled_rounds"]) + 1
-        for m in misses:
+        if ins.get("below_payout_threshold"):
+            agg["below_payout_threshold_events"] = int(agg["below_payout_threshold_events"]) + 1
+        if ins.get("column_vs_payout_gap"):
+            agg["column_vs_payout_gap_events"] = int(agg["column_vs_payout_gap_events"]) + 1
+        for m in misses or []:
             agg["miss_events_total"] = int(agg["miss_events_total"]) + 1
             if m.get("single_pick"):
                 agg["miss_on_single_pick"] = int(agg["miss_on_single_pick"]) + 1
@@ -158,6 +164,54 @@ def analyze_column_coverage(
     return {"covered_columns": covered, "misses": misses}
 
 
+def analyze_played_vs_outcomes(
+    played_picks: List[str],
+    outcomes_13: str,
+) -> Dict[str, Any]:
+    """Jämför faktiskt spelade tecken per match mot utfall."""
+    cov = analyze_column_coverage(
+        [{"Match": f"M{i+1}", "Förslag": p} for i, p in enumerate(played_picks[:13])],
+        outcomes_13,
+    )
+    return {
+        "played_column_coverage": int(cov["covered_columns"]),
+        "misses_played": cov["misses"],
+    }
+
+
+def build_settlement_insights(
+    recommendation_rows: List[Dict[str, Any]],
+    hits_best_row: int,
+    outcomes_13: Optional[str],
+    *,
+    played_picks: Optional[List[str]] = None,
+    payout_threshold: int = 10,
+) -> Dict[str, Any]:
+    insights: Dict[str, Any] = {
+        "hits_best_row": int(hits_best_row),
+        "payout_threshold": int(payout_threshold),
+        "below_payout_threshold": int(hits_best_row) < int(payout_threshold),
+    }
+    if not outcomes_13:
+        return insights
+
+    cov = analyze_column_coverage(recommendation_rows, outcomes_13)
+    insights["column_coverage"] = cov["covered_columns"]
+    insights["misses_detail"] = cov["misses"]
+    col_cov = int(cov["covered_columns"])
+    insights["column_vs_payout_gap"] = (
+        col_cov >= payout_threshold and int(hits_best_row) < payout_threshold
+    )
+
+    if played_picks:
+        played = analyze_played_vs_outcomes(played_picks, outcomes_13)
+        insights["played_column_coverage"] = played["played_column_coverage"]
+        insights["misses_played"] = played["misses_played"]
+        insights["played_vs_model_gap"] = int(cov["covered_columns"]) - int(played["played_column_coverage"])
+
+    return insights
+
+
 def settle_bet(
     journal_path: Path,
     bet_id: str,
@@ -176,28 +230,21 @@ def settle_bet(
     if bet.get("status") != "pending":
         raise ValueError("Spelet är redan rättat.")
 
-    insights: Dict[str, Any] = {"hits_best_row": int(hits_best_row)}
-    if outcomes_13:
-        cov = analyze_column_coverage(bet.get("recommendation_rows", []), outcomes_13)
-        insights["column_coverage"] = cov["covered_columns"]
-        insights["misses_detail"] = cov["misses"]
-        agg = data["aggregate"]
-        agg["settled_rounds"] = int(agg.get("settled_rounds", 0)) + 1
-        for m in cov["misses"]:
-            agg["miss_events_total"] = int(agg.get("miss_events_total", 0)) + 1
-            if m["single_pick"]:
-                agg["miss_on_single_pick"] = int(agg.get("miss_on_single_pick", 0)) + 1
-                if m["favorite_side"]:
-                    agg["miss_on_single_favorite"] = int(agg.get("miss_on_single_favorite", 0)) + 1
-                else:
-                    agg["miss_on_single_underdog"] = int(agg.get("miss_on_single_underdog", 0)) + 1
-
+    played = bet.get("played_picks")
+    insights = build_settlement_insights(
+        bet.get("recommendation_rows", []),
+        int(hits_best_row),
+        outcomes_13,
+        played_picks=played if isinstance(played, list) else None,
+        payout_threshold=10,
+    )
     bet["status"] = "settled"
     bet["settled_at"] = _utc_now_iso()
     bet["insights"] = insights
     if outcomes_13:
         bet["outcomes_13"] = outcomes_13.strip().upper()
 
+    data["aggregate"] = rebuild_aggregate_from_bets(data["bets"])
     save_journal(journal_path, data)
     if after_save:
         after_save(data)
@@ -238,22 +285,96 @@ def add_pending_bet(
 def learning_hint(data: Dict[str, Any]) -> str:
     agg = data.get("aggregate") or _empty_aggregate()
     n = int(agg.get("settled_rounds", 0))
-    if n < 2:
-        return "Spara och rätta minst två omgångar med rätt rad för personlig lärdom."
+    parts: List[str] = []
+    if n < 1:
+        parts.append(
+            "Inbyggd lärdom från Vecka 22: **8 kolumner rätt kan ge 0 kr** — målet är ≥10 rätt på en rad. "
+            "Använd **Trygg** och logga dina spel under Mina spel."
+        )
+        return " ".join(parts)
+
+    parts.append(f"Baserat på {n} rättade omgång(ar) i loggen.")
+    gap = int(agg.get("column_vs_payout_gap_events", 0))
+    below = int(agg.get("below_payout_threshold_events", 0))
+    if below >= 1 or gap >= 1:
+        parts.append(
+            "Du har haft omgångar med **många rätta tecken men under utdelningsgränsen (10)** — "
+            "prioritera halvgardering framför smala spikar."
+        )
     sp = int(agg.get("miss_on_single_pick", 0))
     fav = int(agg.get("miss_on_single_favorite", 0))
-    parts = [f"Baserat på {n} rättade omgångar i loggen."]
     if sp >= 3 and fav >= sp // 2:
         parts.append(
-            "Du missar ofta på **spikar där modellen favoriserar ett tecken** — prova mer halvgardering nästa gång."
+            "Du missar ofta på **spikar där modellen favoriserar ett tecken** — safe-strategin höjer nu tröskeln för spik."
         )
-    elif sp >= 3:
-        parts.append(
-            "Du missar ofta på **smala spikar** — överväg halvgardering på osäkra favoriter."
-        )
+    elif sp >= 2:
+        parts.append("Flera missar på **smala spikar** — överväg 1X/X2 på cup- och rotationsmatcher.")
     else:
-        parts.append("Mönstret är ännu blandat; fortsätt logga rätt rader för tydligare signal.")
+        parts.append("Fortsätt logga rätt rad + antal rätt på bästa rad för skarpare kalibrering.")
     return " ".join(parts)
+
+
+def ensure_seed_week_22(journal_path: Path, base_dir: Path) -> bool:
+    """
+    Lägger in rättad Vecka 22 om den saknas (användarens faktiska spel).
+    Returnerar True om ny post skapades.
+    """
+    data = load_journal(journal_path)
+    for b in data.get("bets") or []:
+        if b.get("round_id") == "europatipset_v2026-22" or "Vecka 22" in str(b.get("draw_comment", "")):
+            return False
+
+    from round_lessons import (
+        WEEK_22_MATCHES,
+        WEEK_22_OUTCOMES,
+        WEEK_22_PLAYED_PICKS,
+        WEEK_22_REFERENCE_SAFE_PICKS,
+        analyze_week_22_case,
+    )
+
+    case = analyze_week_22_case()
+    rec_rows = [
+        {
+            "Match": m,
+            "Förslag": p,
+            "P1": 0.45,
+            "PX": 0.30,
+            "P2": 0.25,
+        }
+        for m, p in zip(WEEK_22_MATCHES, WEEK_22_REFERENCE_SAFE_PICKS)
+    ]
+    insights = build_settlement_insights(
+        rec_rows,
+        hits_best_row=8,
+        outcomes_13=WEEK_22_OUTCOMES,
+        played_picks=WEEK_22_PLAYED_PICKS,
+        payout_threshold=10,
+    )
+    insights["headline_lessons"] = case["headline_lessons"]
+    insights["reference_safe_coverage"] = case["reference_safe_coverage"]
+
+    bet = {
+        "id": "bet_seed_v2026w22",
+        "status": "settled",
+        "saved_at": _utc_now_iso(),
+        "settled_at": _utc_now_iso(),
+        "round_id": "europatipset_v2026-22",
+        "draw_number": "2026-22",
+        "draw_comment": "Vecka 22 - Onsdag 2026-05-27",
+        "reg_close_time": "2026-05-27T18:59:00+02:00",
+        "game_type": "europatipset",
+        "system_rows": 54,
+        "note": "Seed: faktiskt spel (8 rätt, 0 kr). Modellen kalibreras mot denna omgång.",
+        "played_picks": WEEK_22_PLAYED_PICKS,
+        "outcomes_13": WEEK_22_OUTCOMES,
+        "recommendation_rows": rec_rows,
+        "insights": insights,
+    }
+    data.setdefault("bets", []).insert(0, bet)
+    data["version"] = 2
+    data["aggregate"] = rebuild_aggregate_from_bets(data["bets"])
+    save_journal(journal_path, data)
+    return True
 
 
 def append_outcomes_training_rows(

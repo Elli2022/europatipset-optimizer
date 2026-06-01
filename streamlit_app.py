@@ -34,10 +34,12 @@ from play_journal import (
     add_pending_bet,
     append_outcomes_training_rows,
     default_journal_path,
+    ensure_seed_week_22,
     learning_hint,
     load_journal,
     settle_bet,
 )
+from round_lessons import builtin_lessons_summary, payout_min_rights
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,6 +48,7 @@ INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
 MODEL_PATH = DATA_DIR / "models" / "calibration.pkl"
 OFFICIAL_COUPON_PATH = INPUT_DIR / "official_coupon.csv"
+OFFICIAL_COUPON_EDITED_PATH = INPUT_DIR / "official_coupon_edited.csv"
 RECOMMENDATION_PATH = OUTPUT_DIR / "recommendation_official.csv"
 API_HISTORY_PATH = DATA_DIR / "raw" / "history_api.csv"
 SS_CONTEXT_PATH = DATA_DIR / "raw" / "svenskaspel_round_context.json"
@@ -153,15 +156,25 @@ def _format_draw_meta(meta: dict) -> tuple[str, str]:
         return "Vecka/datum saknas", f"Omgång: {meta.get('draw_comment', '-')}"
 
 
-def _run_recommendation(max_rows: int) -> pd.DataFrame:
+def _run_recommendation(
+    max_rows: int,
+    *,
+    coupon_path: Path | None = None,
+    use_manual_context_adjustment: bool = True,
+    manual_context_strength: float = 0.08,
+) -> pd.DataFrame:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    journal = load_journal(JOURNAL_PATH)
     return suggest_system(
-        coupon_csv=OFFICIAL_COUPON_PATH,
+        coupon_csv=coupon_path or OFFICIAL_COUPON_PATH,
         model_file=MODEL_PATH,
         max_rows=max_rows,
         out_csv=RECOMMENDATION_PATH,
         strategy=st.session_state.get("strategy", "balanced"),
         game_type=st.session_state.get("game_type", "europatipset"),
+        use_manual_context_adjustment=use_manual_context_adjustment,
+        manual_context_strength=manual_context_strength,
+        journal_aggregate=journal.get("aggregate"),
     )
 
 
@@ -329,8 +342,10 @@ def _render_my_spel_page() -> None:
                 rows_out.append(
                     {
                         "Omgång": bet.get("draw_comment", ""),
-                        "Rätt antal (bästa rad)": ins.get("hits_best_row", ""),
-                        "Täckning kolumner": ins.get("column_coverage", ""),
+                        "Bästa rad": ins.get("hits_best_row", ""),
+                        "Modell kolumner": ins.get("column_coverage", ""),
+                        "Spelat kolumner": ins.get("played_column_coverage", ""),
+                        "Under 10 rätt": "Ja" if ins.get("below_payout_threshold") else "Nej",
                         "Datum": bet.get("settled_at", ""),
                     }
                 )
@@ -378,6 +393,9 @@ with st.sidebar:
     page_section = st.radio("Sektion", ["Analyser", "Mina spel"], index=0)
 
 ensure_journal_merged_once_session(JOURNAL_PATH)
+USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+if ensure_seed_week_22(JOURNAL_PATH, BASE_DIR):
+    sync_journal_to_browser(load_journal(JOURNAL_PATH))
 
 if page_section == "Mina spel":
     st.title("Mina spel")
@@ -432,9 +450,9 @@ with st.sidebar:
     )
     _journal_for_hint = load_journal(JOURNAL_PATH)
     _agg = _journal_for_hint.get("aggregate") or {}
-    if int(_agg.get("settled_rounds", 0)) >= 1:
-        st.markdown("##### Lärdom från Mina spel")
-        st.markdown(learning_hint(_journal_for_hint))
+    with st.expander("Lärdom & kalibrering (spellogg)", expanded=int(_agg.get("settled_rounds", 0)) >= 1):
+        st.markdown(builtin_lessons_summary())
+        st.caption(learning_hint(_journal_for_hint))
     if st.button("Synka API-historik nu", use_container_width=True):
         if not os.getenv("FOOTBALL_DATA_API_KEY"):
             st.error("Saknar FOOTBALL_DATA_API_KEY. Lägg till i miljövariabler/Streamlit Secrets.")
@@ -491,6 +509,12 @@ if "backtest_df" not in st.session_state:
     st.session_state["backtest_df"] = None
 if "ss_context_bundle" not in st.session_state:
     st.session_state["ss_context_bundle"] = None
+if "use_manual_context_adjustment" not in st.session_state:
+    st.session_state["use_manual_context_adjustment"] = True
+if "manual_context_strength" not in st.session_state:
+    st.session_state["manual_context_strength"] = 0.08
+if "use_edited_coupon_for_reco" not in st.session_state:
+    st.session_state["use_edited_coupon_for_reco"] = False
 
 if st.button("Hämta officiell kupong och beräkna förslag", type="primary", use_container_width=True):
     with st.spinner("Hämtar officiell kupong och räknar fram förslag..."):
@@ -499,7 +523,17 @@ if st.button("Hämta officiell kupong och beräkna förslag", type="primary", us
             coupon_df, meta = fetch_official_coupon_state()
             INPUT_DIR.mkdir(parents=True, exist_ok=True)
             coupon_df.to_csv(OFFICIAL_COUPON_PATH, index=False)
-            result_df = _run_recommendation(max_rows=max_rows)
+            chosen_coupon = (
+                OFFICIAL_COUPON_EDITED_PATH
+                if st.session_state.get("use_edited_coupon_for_reco") and OFFICIAL_COUPON_EDITED_PATH.exists()
+                else OFFICIAL_COUPON_PATH
+            )
+            result_df = _run_recommendation(
+                max_rows=max_rows,
+                coupon_path=chosen_coupon,
+                use_manual_context_adjustment=bool(st.session_state.get("use_manual_context_adjustment", True)),
+                manual_context_strength=float(st.session_state.get("manual_context_strength", 0.08)),
+            )
             st.session_state["coupon_df"] = coupon_df
             st.session_state["result_df"] = result_df
             st.session_state["meta"] = meta
@@ -586,6 +620,12 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                         st.dataframe(formatted, use_container_width=True, hide_index=True)
                     st.metric("Systemrader", int(result_df["Systemrader"].iloc[0]))
                     st.caption(f"Strategi: {st.session_state.get('strategy', 'balanced')}")
+                    _gt = st.session_state.get("game_type", "europatipset")
+                    _mp = payout_min_rights(_gt)
+                    st.info(
+                        f"Europatipset betalar från **{_mp} rätt på en rad**. "
+                        f"Kolumn-täckning (rätt tecken någonstans i raden) räcker inte — se **Träffprognos**."
+                    )
                     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
                     if st.button("Spara till Mina spel", key="save_play_journal", use_container_width=True):
                         bid = add_pending_bet(
@@ -687,15 +727,24 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
 
                 with tab3:
                     scenarios = []
+                    scenario_coupon = (
+                        OFFICIAL_COUPON_EDITED_PATH
+                        if st.session_state.get("use_edited_coupon_for_reco") and OFFICIAL_COUPON_EDITED_PATH.exists()
+                        else OFFICIAL_COUPON_PATH
+                    )
                     for budget in compare_budgets:
                         tmp_out = OUTPUT_DIR / f"scenario_{budget}.csv"
                         df_budget = suggest_system(
-                            coupon_csv=OFFICIAL_COUPON_PATH,
+                            coupon_csv=scenario_coupon,
                             model_file=MODEL_PATH,
                             max_rows=int(budget),
                             out_csv=tmp_out,
                             strategy=st.session_state.get("strategy", "balanced"),
                             game_type=st.session_state.get("game_type", "europatipset"),
+                            use_manual_context_adjustment=bool(
+                                st.session_state.get("use_manual_context_adjustment", True)
+                            ),
+                            manual_context_strength=float(st.session_state.get("manual_context_strength", 0.08)),
                         )
                         scenarios.append(
                             {
@@ -713,16 +762,25 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                     n_sim = st.slider("Antal simuleringar", min_value=5000, max_value=50000, value=20000, step=5000)
                     if st.button("Beräkna prognos", key="run_prob_forecast"):
                         with st.spinner("Simulerar utfallsfördelning..."):
-                            st.session_state["forecast_dist"] = simulate_rights_distribution(result_df, n_sim=n_sim)
+                            st.session_state["forecast_dist"] = simulate_rights_distribution(
+                                result_df,
+                                n_sim=n_sim,
+                                game_type=st.session_state.get("game_type", "europatipset"),
+                            )
                     dist = st.session_state.get("forecast_dist")
                     if dist:
-                        c1, c2, c3, c4, c5 = st.columns(5)
-                        c1.metric("10 rätt", f"{dist[10]*100:.1f}%")
-                        c2.metric("11 rätt", f"{dist[11]*100:.1f}%")
-                        c3.metric("12 rätt", f"{dist[12]*100:.1f}%")
-                        c4.metric("13 rätt", f"{dist[13]*100:.2f}%")
-                        c5.metric("Mest sannolikt", f"{dist['most_likely']} rätt")
-                        st.caption("Prognosen är Monte Carlo-baserad och beror på modellens sannolikheter.")
+                        min_pay = int(dist.get("min_payout_rights", payout_min_rights("europatipset")))
+                        p_pay = float(dist.get(f"p_ge_{min_pay}", 0.0))
+                        c1, c2, c3, c4, c5, c6 = st.columns(6)
+                        c1.metric("10 rätt", f"{dist.get(10, 0)*100:.1f}%")
+                        c2.metric("11 rätt", f"{dist.get(11, 0)*100:.1f}%")
+                        c3.metric("12 rätt", f"{dist.get(12, 0)*100:.1f}%")
+                        c4.metric("13 rätt", f"{dist.get(13, 0)*100:.2f}%")
+                        c5.metric(f"≥{min_pay} rätt (utdelning)", f"{p_pay*100:.1f}%")
+                        c6.metric("Mest sannolikt", f"{dist['most_likely']} rätt")
+                        st.caption(
+                            "Prognosen är Monte Carlo på **bästa rad** i systemet — inte bara antal rätta kolumner."
+                        )
 
                 with tab5:
                     st.markdown("#### Jämför vinst mot insats")
@@ -881,14 +939,57 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                     else:
                         st.dataframe(coupon_df, use_container_width=True, hide_index=True)
                     st.markdown("#### Redigerbar kupong (vad-om)")
+                    st.caption(
+                        "Tips: fyll `ManualHomeAdj` / `ManualDrawAdj` / `ManualAwayAdj` per match i intervallet "
+                        "`[-1, +1]` för sen info (elvor/nyheter). + = stärker utfallet, - = försvagar."
+                    )
+                    coupon_edit_base = coupon_df.copy()
+                    for c in ["ManualHomeAdj", "ManualDrawAdj", "ManualAwayAdj"]:
+                        if c not in coupon_edit_base.columns:
+                            coupon_edit_base[c] = 0.0
                     edited = st.data_editor(
-                        coupon_df,
+                        coupon_edit_base,
                         num_rows="fixed",
                         use_container_width=True,
                         hide_index=True,
                     )
-                    edited_path = INPUT_DIR / "official_coupon_edited.csv"
+                    edited_path = OFFICIAL_COUPON_EDITED_PATH
                     pd.DataFrame(edited).to_csv(edited_path, index=False)
+                    c_m1, c_m2, c_m3 = st.columns(3)
+                    with c_m1:
+                        st.session_state["use_edited_coupon_for_reco"] = st.checkbox(
+                            "Använd redigerad kupong i beräkning",
+                            value=bool(st.session_state.get("use_edited_coupon_for_reco", False)),
+                        )
+                    with c_m2:
+                        st.session_state["use_manual_context_adjustment"] = st.checkbox(
+                            "Aktivera manuell sen-info-justering",
+                            value=bool(st.session_state.get("use_manual_context_adjustment", True)),
+                        )
+                    with c_m3:
+                        st.session_state["manual_context_strength"] = st.slider(
+                            "Styrka manuell justering",
+                            min_value=0.0,
+                            max_value=0.30,
+                            value=float(st.session_state.get("manual_context_strength", 0.08)),
+                            step=0.01,
+                        )
+                    if st.button("Räkna om förslag med dessa manuella signaler", key="rerun_manual_context"):
+                        coupon_choice = (
+                            OFFICIAL_COUPON_EDITED_PATH
+                            if st.session_state.get("use_edited_coupon_for_reco")
+                            else OFFICIAL_COUPON_PATH
+                        )
+                        new_result = _run_recommendation(
+                            max_rows=max_rows,
+                            coupon_path=coupon_choice,
+                            use_manual_context_adjustment=bool(
+                                st.session_state.get("use_manual_context_adjustment", True)
+                            ),
+                            manual_context_strength=float(st.session_state.get("manual_context_strength", 0.08)),
+                        )
+                        st.session_state["result_df"] = new_result
+                        st.success("Nytt systemförslag beräknat med manuella signaler.")
                     st.caption(f"Redigerad kupong sparad: {edited_path}")
                     st.caption(f"Rekommendation sparad i {RECOMMENDATION_PATH}")
 

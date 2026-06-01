@@ -15,6 +15,7 @@ import requests
 
 from coupon_enrichment import add_streck_volatility_column, enrich_coupon_with_history_form
 from dotenv import load_dotenv
+from round_lessons import journal_calibration_params, payout_min_rights, spike_risk_score
 from sklearn.linear_model import LogisticRegression
 
 
@@ -45,8 +46,8 @@ COMPETITION_CODES = [
 ]
 
 GAME_TYPES = {
-    "europatipset": {"match_count": 13, "row_price": 1.0},
-    "topptipset": {"match_count": 8, "row_price": 1.0},
+    "europatipset": {"match_count": 13, "row_price": 1.0, "min_payout_rights": 10},
+    "topptipset": {"match_count": 8, "row_price": 1.0, "min_payout_rights": 8},
 }
 
 
@@ -888,6 +889,9 @@ def parse_coupon(coupon_csv: Path) -> pd.DataFrame:
         "FormH_pts5",
         "FormB_pts5",
         "StreckVol",
+        "ManualHomeAdj",
+        "ManualDrawAdj",
+        "ManualAwayAdj",
     ]:
         if col not in df.columns:
             df[col] = np.nan
@@ -1019,14 +1023,42 @@ def adjust_probs_form_and_volatility(
     return float(p[0]), float(p[1]), float(p[2])
 
 
+def adjust_probs_manual_context(
+    p1: float,
+    px: float,
+    p2: float,
+    home_adj: float,
+    draw_adj: float,
+    away_adj: float,
+    *,
+    strength: float = 0.08,
+) -> Tuple[float, float, float]:
+    """
+    Manuell, mild "sen info"-justering (elvor/nyheter/känsla) per utfall.
+    Varje adj förväntas ligga i ungefär [-1, +1], och skalar sannolikheten lätt.
+    """
+    p = np.clip(np.array([p1, px, p2], dtype=float), 1e-9, 1.0)
+    p = p / p.sum()
+    a = np.array([home_adj, draw_adj, away_adj], dtype=float)
+    a = np.clip(a, -1.0, 1.0)
+    p = p * (1.0 + float(strength) * a)
+    p = np.clip(p, 1e-9, 1.0)
+    p = p / p.sum()
+    return float(p[0]), float(p[1]), float(p[2])
+
+
 def optimize_system(
     matches: List[MatchSuggestion],
     max_rows: int,
     strategy: str = "balanced",
+    *,
+    journal_aggregate: Optional[Dict] = None,
+    game_type: str = "europatipset",
 ) -> Tuple[List[str], int]:
     options = ["1", "X", "2"]
     probs = [np.array([m.p1, m.px, m.p2]) for m in matches]
     order = [list(np.argsort(-p)) for p in probs]
+    cal = journal_calibration_params(journal_aggregate)
 
     # Start with one sign each.
     current = [[order[i][0]] for i in range(len(matches))]
@@ -1039,19 +1071,34 @@ def optimize_system(
         # Proxy for chance to have at least one winning row.
         base = float(sum(math.log(max(1e-9, cover(i, state[i]))) for i in range(len(state))))
         if strategy == "safe":
-            # Bias slightly toward favorites (higher max sign probability per match).
             safe_bonus = float(
                 sum(max(probs[i][state[i]]) for i in range(len(state))) / max(1, len(state))
             )
-            return base + 0.90 * safe_bonus
+            width_bonus = float(sum(len(state[i]) for i in range(len(state))) / max(1, len(state)))
+            payout_bonus = float(
+                sum(
+                    (1.0 - max(probs[i][state[i]])) * max(0, 2 - len(state[i]))
+                    for i in range(len(state))
+                )
+                / max(1, len(state))
+            )
+            return base + 0.65 * safe_bonus + 0.35 * width_bonus + 1.10 * payout_bonus
         if strategy == "value":
-            # Bias slightly toward wider coverage in uncertain matches.
             width_bonus = float(sum(len(state[i]) for i in range(len(state))) / max(1, len(state)))
             entropy_bonus = float(
                 sum((-np.sum(probs[i] * np.log(np.clip(probs[i], 1e-9, 1.0)))) * len(state[i]) for i in range(len(state)))
                 / max(1, len(state))
             )
             return base + 0.28 * width_bonus + 0.12 * entropy_bonus
+        if strategy == "balanced":
+            payout_bonus = float(
+                sum(
+                    spike_risk_score(probs[i]) * max(0, 2 - len(state[i]))
+                    for i in range(len(state))
+                )
+                / max(1, len(state))
+            )
+            return base + 0.55 * payout_bonus
         return base
 
     while True:
@@ -1078,6 +1125,10 @@ def optimize_system(
             delta = score(new_state) - current_score
             cost = new_rows - rows
             value = delta / max(1, cost)
+            if strategy in ("safe", "balanced") and len(selected) == 1:
+                risk = spike_risk_score(probs[i])
+                if risk >= cal["hedge_boost_threshold"]:
+                    value *= 1.0 + cal["hedge_value_multiplier"] * risk
 
             if best_delta is None or value > best_delta:
                 best_delta = value
@@ -1088,6 +1139,21 @@ def optimize_system(
             break
         current = best_new_state
         rows = best_new_rows
+
+    if strategy in ("safe", "balanced"):
+        for i in range(len(matches)):
+            if len(current[i]) > 1:
+                continue
+            top_p = float(max(probs[i]))
+            risk = spike_risk_score(probs[i])
+            needs_hedge = top_p < cal["spike_min_top_prob"] or risk >= cal["force_hedge_risk"]
+            if not needs_hedge:
+                continue
+            candidate = [order[i][0], order[i][1]]
+            new_rows = rows * 2
+            if new_rows <= max_rows:
+                current[i] = candidate
+                rows = new_rows
 
     picks = []
     for i, selected in enumerate(current):
@@ -1112,6 +1178,8 @@ def simulate_rights_distribution(
     result_df: pd.DataFrame,
     n_sim: int = 20000,
     seed: int = 42,
+    *,
+    game_type: str = "europatipset",
 ) -> Dict:
     picks = result_df["Förslag"].tolist()
     row_matrix = expand_system_rows(picks)
@@ -1122,6 +1190,7 @@ def simulate_rights_distribution(
     probs = probs / probs.sum(axis=1, keepdims=True)
     n_matches = probs.shape[0]
     rng = np.random.default_rng(seed)
+    min_pay = payout_min_rights(game_type)
 
     outcomes = np.zeros((n_sim, n_matches), dtype=np.int8)
     for i in range(n_matches):
@@ -1134,6 +1203,8 @@ def simulate_rights_distribution(
 
     dist = {k: float((max_hits == k).mean()) for k in sorted(set(max_hits.tolist()))}
     dist["most_likely"] = int(Counter(max_hits.tolist()).most_common(1)[0][0])
+    dist["min_payout_rights"] = min_pay
+    dist[f"p_ge_{min_pay}"] = float((max_hits >= min_pay).mean())
     return dist
 
 
@@ -1193,6 +1264,9 @@ def suggest_system(
     use_volatility_probability_adjustment: bool = True,
     include_favourites_in_blend: bool = True,
     include_tio_in_blend: bool = True,
+    use_manual_context_adjustment: bool = True,
+    manual_context_strength: float = 0.08,
+    journal_aggregate: Optional[Dict] = None,
 ) -> pd.DataFrame:
     with open(model_file, "rb") as f:
         model = pickle.load(f)
@@ -1249,6 +1323,29 @@ def suggest_system(
             enable_form=use_form_probability_adjustment,
             enable_vol=use_volatility_probability_adjustment,
         )
+        if use_manual_context_adjustment:
+            try:
+                mh = float(row.get("ManualHomeAdj", np.nan))
+            except Exception:
+                mh = float("nan")
+            try:
+                md = float(row.get("ManualDrawAdj", np.nan))
+            except Exception:
+                md = float("nan")
+            try:
+                ma = float(row.get("ManualAwayAdj", np.nan))
+            except Exception:
+                ma = float("nan")
+            if any(pd.notna(v) for v in [mh, md, ma]):
+                p1, px, p2 = adjust_probs_manual_context(
+                    p1,
+                    px,
+                    p2,
+                    0.0 if np.isnan(mh) else mh,
+                    0.0 if np.isnan(md) else md,
+                    0.0 if np.isnan(ma) else ma,
+                    strength=float(np.clip(manual_context_strength, 0.0, 0.30)),
+                )
         m = MatchSuggestion(
             match=str(row["Match"]),
             odd1=float(row["Odd1"]),
@@ -1264,7 +1361,13 @@ def suggest_system(
         )
         matches.append(m)
 
-    picks, rows = optimize_system(matches, max_rows=max_rows, strategy=strategy)
+    picks, rows = optimize_system(
+        matches,
+        max_rows=max_rows,
+        strategy=strategy,
+        journal_aggregate=journal_aggregate,
+        game_type=game_type,
+    )
 
     out = coupon.copy()
     out["P1"] = [m.p1 for m in matches]

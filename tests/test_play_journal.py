@@ -50,3 +50,21 @@ def test_settle_updates_aggregate(tmp_path: Path):
     assert data["bets"][0]["status"] == "settled"
     assert data["aggregate"]["settled_rounds"] == 1
     assert data["aggregate"]["miss_events_total"] == 13
+    assert data["bets"][0]["insights"]["below_payout_threshold"] is True
+
+
+def test_learning_hint_with_seed_aggregate():
+    from play_journal import learning_hint
+
+    hint = learning_hint(
+        {
+            "aggregate": {
+                "settled_rounds": 1,
+                "below_payout_threshold_events": 1,
+                "column_vs_payout_gap_events": 0,
+                "miss_on_single_pick": 3,
+                "miss_on_single_favorite": 2,
+            }
+        }
+    )
+    assert "10" in hint or "utdelningsgränsen" in hint

@@ -4,7 +4,12 @@ from pathlib import Path
 import pandas as pd
 
 from coupon_enrichment import add_streck_volatility_column, enrich_coupon_with_history_form
-from europatipset import _odd_mv_triplet, _streck_mv_triplet, adjust_probs_form_and_volatility
+from europatipset import (
+    _odd_mv_triplet,
+    _streck_mv_triplet,
+    adjust_probs_form_and_volatility,
+    adjust_probs_manual_context,
+)
 
 
 def _tf(v, default=float("nan")):
@@ -92,3 +97,10 @@ def test_adjust_form_disabled_ignores_form_diff():
     b = adjust_probs_form_and_volatility(0.34, 0.33, 0.33, 0.0, 15.0, float("nan"), enable_form=False)
     assert abs(a[0] - b[0]) < 1e-9
     assert abs(a[2] - b[2]) < 1e-9
+
+
+def test_adjust_manual_context_biases_selected_outcome():
+    base = (0.40, 0.30, 0.30)
+    home_up = adjust_probs_manual_context(*base, 1.0, 0.0, -1.0, strength=0.10)
+    assert home_up[0] > base[0]
+    assert home_up[2] < base[2]

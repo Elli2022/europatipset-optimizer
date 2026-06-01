@@ -10,7 +10,8 @@ En Python-app som:
 
 - Marknadsodds är normalt den starkaste baseline-signalen.
 - Historik används för att kalibrera rå odds-sannolikheter till bättre träffsäkerhet.
-- Optimeringen prioriterar tecken/garderingar som ger bäst täckning per extra systemrad.
+- Optimeringen prioriterar tecken/garderingar som ökar sannolikheten för **minst 10 rätt på en rad** (Europatipset), inte bara flest rätta kolumner.
+- Spellogg (`Mina spel`) och inbyggd analys från Vecka 22 (2026-05-27) kalibrerar **safe**-strategin: färre riskabla spikar, fler halvgarderingar när modellen ser osäkerhet.
 
 ## Kom igång
 
