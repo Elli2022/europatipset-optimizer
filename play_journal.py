@@ -100,14 +100,14 @@ def merge_journal_data(
     bets_b = {str(x["id"]): x for x in (bb.get("bets") or []) if x.get("id")}
     merged_map: Dict[str, Dict[str, Any]] = {}
     for bid in set(bets_a) | set(bets_b):
-        ba = bets_a.get(bid)
-        bb = bets_b.get(bid)
-        if ba is None:
-            merged_map[bid] = bb  # type: ignore[assignment]
-        elif bb is None:
-            merged_map[bid] = ba
+        bet_a = bets_a.get(bid)
+        bet_b = bets_b.get(bid)
+        if bet_a is None:
+            merged_map[bid] = bet_b  # type: ignore[assignment]
+        elif bet_b is None:
+            merged_map[bid] = bet_a
         else:
-            merged_map[bid] = _pick_newer_duplicate_bet(ba, bb)
+            merged_map[bid] = _pick_newer_duplicate_bet(bet_a, bet_b)
     bets_list = sorted(merged_map.values(), key=lambda x: x.get("saved_at", ""), reverse=True)
     ver = max(int(aa.get("version", 1)), int(bb.get("version", 1)))
     return {

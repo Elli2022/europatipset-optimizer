@@ -44,3 +44,20 @@ def test_merge_prefers_settled_when_duplicate_ids():
     }
     m = merge_journal_data(a, b)
     assert m["bets"][0]["status"] == "settled"
+
+
+def test_merge_reads_journal_version_after_bet_only_in_first_source():
+    """Regression: loop vars must not shadow journal bb when last id is disk-only."""
+    a = {
+        "version": 3,
+        "bets": [{"id": "only_disk", "status": "pending", "saved_at": "2026-01-01T00:00:00+00:00"}],
+        "aggregate": {},
+    }
+    b = {
+        "version": 7,
+        "bets": [{"id": "only_browser", "status": "pending", "saved_at": "2026-01-02T00:00:00+00:00"}],
+        "aggregate": {},
+    }
+    m = merge_journal_data(a, b)
+    assert m["version"] == 7
+    assert {x["id"] for x in m["bets"]} == {"only_disk", "only_browser"}
