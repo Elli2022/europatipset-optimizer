@@ -359,7 +359,97 @@ def _streck_mv_triplet(curr_pct: List[object], prev_pct: List[object], _to_float
     return float(out[0]), float(out[1]), float(out[2])
 
 
-def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
+def _to_float_odds(v: object, default: float = float("nan")) -> float:
+    try:
+        return float(str(v).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _odds_triplet_from_stat_block(stat_block: Dict, key: str) -> Tuple[float, float, float]:
+    vals = stat_block.get(key, {}).get("current", {}).get("value", [None, None, None])
+    if len(vals) != 3:
+        return float("nan"), float("nan"), float("nan")
+    if any(v in [None, ""] for v in vals):
+        return float("nan"), float("nan"), float("nan")
+    return (
+        _to_float_odds(vals[0]),
+        _to_float_odds(vals[1]),
+        _to_float_odds(vals[2]),
+    )
+
+
+def odds_from_streck_distribution(
+    streck1: float,
+    streckx: float,
+    streck2: float,
+    *,
+    overround: float = 1.10,
+) -> Tuple[float, float, float]:
+    """
+    Gratis fallback när Svenska Spel saknar odds men streck finns.
+    Streck tolkas som sannolikhetsandelar; overround ~ bookmaker margin.
+    """
+    p = np.array([streck1, streckx, streck2], dtype=float)
+    if np.nanmax(p) > 1.5:
+        p = p / 100.0
+    if np.any(np.isnan(p)) or float(p.sum()) <= 0:
+        return float("nan"), float("nan"), float("nan")
+    p = np.clip(p, 1e-4, 1.0)
+    p = p / p.sum()
+    return tuple(float(overround / pi) for pi in p)
+
+
+def resolve_match_odds(
+    stat: Dict,
+    streck_triplet: Tuple[float, float, float],
+    *,
+    allow_streck_estimate: bool = True,
+) -> Tuple[float, float, float, str]:
+    """
+    Lös 1/X/2-odds från Svenska Spels statistik med fallbacks.
+    Returns (odd1, oddx, odd2, source) där source är current|start|streck_estimate|missing.
+    """
+    o1, ox, o2 = _odds_triplet_from_stat_block(stat, "odds")
+    if not any(np.isnan([o1, ox, o2])) and min(o1, ox, o2) > 1.01:
+        return o1, ox, o2, "current"
+
+    s1, sx, s2 = _odds_triplet_from_stat_block(stat, "startOdds")
+    if not any(np.isnan([s1, sx, s2])) and min(s1, sx, s2) > 1.01:
+        return s1, sx, s2, "start"
+
+    if allow_streck_estimate:
+        e1, ex, e2 = odds_from_streck_distribution(*streck_triplet)
+        if not any(np.isnan([e1, ex, e2])) and min(e1, ex, e2) > 1.01:
+            return e1, ex, e2, "streck_estimate"
+
+    return float("nan"), float("nan"), float("nan"), "missing"
+
+
+def coupon_odds_gap_report(df: pd.DataFrame) -> Dict[str, object]:
+    """Sammanfattning av odds-källor per match (för UI)."""
+    if df.empty:
+        return {"complete": 0, "estimated": 0, "missing": [], "by_source": {}}
+    src = df.get("OddsSource", pd.Series(["unknown"] * len(df)))
+    missing_rows = df[df[["Odd1", "OddX", "Odd2"]].isna().any(axis=1)]
+    missing = [
+        f"{int(r.get('EventNumber', i + 1))}. {r.get('Match', '')}"
+        for i, r in missing_rows.reset_index(drop=True).iterrows()
+    ]
+    by_source = {str(k): int(v) for k, v in src.value_counts().items()}
+    return {
+        "complete": int(df[["Odd1", "OddX", "Odd2"]].notna().all(axis=1).sum()),
+        "estimated": int((src == "streck_estimate").sum()),
+        "by_source": by_source,
+        "missing": missing,
+    }
+
+
+def fetch_official_coupon_state(
+    *,
+    allow_streck_estimate: bool = True,
+    required_matches: int = 13,
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
     url = "https://spela.svenskaspel.se/europatipset/statistik"
     response = requests.get(url, timeout=30)
     response.raise_for_status()
@@ -383,23 +473,6 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
         stat_key = f"{match_id}_1_{event_number}"
         stat = event_stats.get(stat_key, {})
 
-        odds_values = (
-            stat.get("odds", {})
-            .get("current", {})
-            .get("value", [None, None, None])
-        )
-        if len(odds_values) != 3:
-            odds_values = [None, None, None]
-        if any(v in [None, ""] for v in odds_values):
-            # After/near kickoff, current odds may be missing; fallback to opening odds.
-            start_odds = (
-                stat.get("startOdds", {})
-                .get("current", {})
-                .get("value", [None, None, None])
-            )
-            if len(start_odds) == 3 and not any(v in [None, ""] for v in start_odds):
-                odds_values = start_odds
-
         distributions = stat.get("distributions", {})
         dist_draw = distributions.get("2", {}).get(draw_number, {})
         dist_current = dist_draw.get("current", {}).get("value", [None, None, None])
@@ -418,6 +491,16 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
                 return float(str(v).replace(",", "."))
             except Exception:
                 return default
+
+        streck1 = _to_float(dist_current[0], 33.33)
+        streckx = _to_float(dist_current[1], 33.33)
+        streck2 = _to_float(dist_current[2], 33.33)
+        odd1, oddx, odd2, odds_source = resolve_match_odds(
+            stat,
+            (streck1, streckx, streck2),
+            allow_streck_estimate=allow_streck_estimate,
+        )
+        odds_values = [odd1, oddx, odd2]
 
         def _triplet_probs_percent(stat_block: Dict, key: str) -> Tuple[float, float, float]:
             """Läser tre procent-strängar (0–100) och normaliserar till sannolikheter."""
@@ -479,13 +562,15 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
 
         rows.append(
             {
+                "EventNumber": int(event_number or len(rows) + 1),
                 "Match": match,
                 "Odd1": _to_float(odds_values[0], np.nan),
                 "OddX": _to_float(odds_values[1], np.nan),
                 "Odd2": _to_float(odds_values[2], np.nan),
-                "Streck1": _to_float(dist_current[0], 33.33),
-                "StreckX": _to_float(dist_current[1], 33.33),
-                "Streck2": _to_float(dist_current[2], 33.33),
+                "OddsSource": odds_source,
+                "Streck1": streck1,
+                "StreckX": streckx,
+                "Streck2": streck2,
                 "Fav1": fav1,
                 "FavX": favx,
                 "Fav2": fav2,
@@ -501,9 +586,18 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
             }
         )
 
-    out = pd.DataFrame(rows).dropna(subset=["Odd1", "OddX", "Odd2"]).head(13)
-    if len(out) < 13:
-        raise RuntimeError(f"Hittade bara {len(out)} matcher med odds i officiell kupong.")
+    out = pd.DataFrame(rows).head(required_matches)
+    report = coupon_odds_gap_report(out)
+    if int(report["complete"]) < required_matches:
+        missing_txt = ", ".join(report["missing"]) if report["missing"] else "okända matcher"
+        hint = (
+            " Fyll saknade odds under Data & export → Redigerbar kupong, "
+            "eller vänta tills Svenska Spel publicerat odds."
+        )
+        raise RuntimeError(
+            f"Hittade bara {report['complete']} matcher med odds i officiell kupong "
+            f"(kräver {required_matches}). Saknas: {missing_txt}.{hint}"
+        )
 
     meta = {
         "draw_number": str(draw.get("drawNumber", "")),
@@ -512,6 +606,8 @@ def fetch_official_coupon_state() -> Tuple[pd.DataFrame, Dict[str, str]]:
         "reg_close_description": str(draw.get("regCloseDescription", "")),
         "current_net_sale": str(draw.get("currentNetSale", "")),
         "row_price": str(draw.get("rowPrice", "")),
+        "odds_estimated_count": str(report["estimated"]),
+        "odds_by_source": json.dumps(report["by_source"], ensure_ascii=False),
     }
     return out, meta
 
@@ -833,6 +929,13 @@ def validate_coupon_data(df: pd.DataFrame) -> List[str]:
     if missing:
         warnings.append(f"Saknar kolumner: {', '.join(sorted(missing))}")
         return warnings
+
+    if "OddsSource" in df.columns:
+        est = int((df["OddsSource"] == "streck_estimate").sum())
+        if est > 0:
+            warnings.append(
+                f"{est} match(er) använder streck-uppskattade odds (Svenska Spel saknade 1/X/2)."
+            )
 
     odd_cols = ["Odd1", "OddX", "Odd2"]
     for col in odd_cols:

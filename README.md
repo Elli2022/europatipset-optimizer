@@ -32,7 +32,8 @@ The optimizer is tuned for a lesson that is easy to forget: **many correct colum
 
 ## Features (web UI)
 
-- Fetch the **official coupon** (odds + streck) from Svenska Spel’s public tips JSON
+- Fetch the **official coupon** (odds + streck) from Svenska Spel’s public tips JSON — with a **free streck-based odds fallback** when 1/X/2 are temporarily missing
+- **Spikrisk** column and default **Safe** strategy focused on reaching **10+ correct on one row**
 - Choose **row budget** and strategy: **Balanced**, **Safe**, or **Value**
 - **System suggestion** table with model probabilities and value vs streck
 - **Budget comparison**, **hit forecast** (Monte Carlo, including **P(≥10 correct)**)

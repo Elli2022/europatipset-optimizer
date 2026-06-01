@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -11,6 +12,7 @@ from europatipset import (
     GAME_TYPES,
     assess_forecast_confidence,
     backtest_strategies,
+    coupon_odds_gap_report,
     download_historical_data,
     fetch_correct_row_for_draw_number,
     fetch_official_coupon_state,
@@ -39,7 +41,7 @@ from play_journal import (
     load_journal,
     settle_bet,
 )
-from round_lessons import builtin_lessons_summary, payout_min_rights
+from round_lessons import builtin_lessons_summary, payout_min_rights, spike_risk_score
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -429,16 +431,23 @@ with st.sidebar:
         options=list(GAME_TYPES.keys()),
         format_func=lambda x: f"{x} ({GAME_TYPES[x]['match_count']} matcher)",
     )
-    max_rows = st.number_input("Max antal rader", min_value=1, max_value=4096, value=64, step=1)
+    max_rows = st.number_input("Max antal rader", min_value=1, max_value=4096, value=54, step=1)
     st.session_state["strategy"] = st.selectbox(
         "Strategi",
-        options=["balanced", "safe", "value"],
+        options=["safe", "balanced", "value"],
+        index=0,
         format_func=lambda x: {
             "balanced": "Balanserad",
-            "safe": "Säker (favorit-fokus)",
+            "safe": "Trygg (≥10 rätt, färre spikar)",
             "value": "Värde (mer gardering)",
         }[x],
     )
+    _sb_meta = _load_cached_meta()
+    _sb_hl = _hours_to_close(_sb_meta)
+    if _sb_hl is not None and _sb_hl > 0:
+        st.caption(f"Spelstopp om ca {int(_sb_hl * 60)} min")
+        if _sb_meta.get("draw_comment"):
+            st.caption(str(_sb_meta["draw_comment"]))
     compare_budgets = st.multiselect(
         "Jämför budgetscenarier",
         options=[16, 32, 64, 128, 256, 512],
@@ -538,10 +547,20 @@ if st.button("Hämta officiell kupong och beräkna förslag", type="primary", us
             st.session_state["result_df"] = result_df
             st.session_state["meta"] = meta
             st.session_state["forecast_dist"] = None
+            gap = coupon_odds_gap_report(coupon_df)
+            if int(gap.get("estimated", 0)) > 0:
+                st.warning(
+                    f"{gap['estimated']} match(er) saknade odds hos Svenska Spel — "
+                    "appens **streck-fallback** användes (gratis). Kontrollera gärna under Data & export."
+                )
             rr, rm = fetch_correct_row_for_draw_number(str(meta.get("draw_number", "")))
             st.session_state["sv_ref"] = {"dn": str(meta.get("draw_number", "")), "row": rr, "msg": rm}
         except Exception as exc:
             st.error(f"Kunde inte hämta eller beräkna kupong: {exc}")
+            st.info(
+                "Tips: gå till **Data & export** om du har en sparad kupong, fyll i saknade Odd1/OddX/Odd2 "
+                "och kryssa i **Använd redigerad kupong i beräkning**."
+            )
 
 if st.session_state["result_df"] is not None and st.session_state["coupon_df"] is not None:
     try:
@@ -602,8 +621,14 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                 st.caption(f"Orsak: {risk_reason}")
 
                 with tab1:
-                    show_cols = ["Match", "Förslag", "P1", "PX", "P2", "Value1", "ValueX", "Value2"]
-                    formatted = result_df[show_cols].copy()
+                    formatted = result_df[["Match", "Förslag", "P1", "PX", "P2", "Value1", "ValueX", "Value2"]].copy()
+                    risks = []
+                    for _, row in result_df.iterrows():
+                        p = np.array([row["P1"], row["PX"], row["P2"]], dtype=float)
+                        p = p / max(p.sum(), 1e-9)
+                        r = spike_risk_score(p)
+                        risks.append("Hög" if r >= 0.55 else ("Medel" if r >= 0.40 else "Låg"))
+                    formatted.insert(2, "Spikrisk", risks)
                     for c in ["P1", "PX", "P2", "Value1", "ValueX", "Value2"]:
                         formatted[c] = (formatted[c] * 100).map(lambda v: f"{v:.1f}%")
                     if mobile_mode:
@@ -937,7 +962,17 @@ if st.session_state["result_df"] is not None and st.session_state["coupon_df"] i
                                     f"Streck 1/X/2: {row['Streck1']} / {row['StreckX']} / {row['Streck2']}"
                                 )
                     else:
-                        st.dataframe(coupon_df, use_container_width=True, hide_index=True)
+                        show_coupon = coupon_df.copy()
+                        if "OddsSource" in show_coupon.columns:
+                            show_coupon["OddsSource"] = show_coupon["OddsSource"].map(
+                                {
+                                    "current": "Oddset nu",
+                                    "start": "Öppningsodds",
+                                    "streck_estimate": "Uppskattat (streck)",
+                                    "missing": "Saknas",
+                                }
+                            ).fillna(show_coupon["OddsSource"])
+                        st.dataframe(show_coupon, use_container_width=True, hide_index=True)
                     st.markdown("#### Redigerbar kupong (vad-om)")
                     st.caption(
                         "Tips: fyll `ManualHomeAdj` / `ManualDrawAdj` / `ManualAwayAdj` per match i intervallet "
