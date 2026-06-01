@@ -1,5 +1,11 @@
 # Europatipset Optimizer
 
+[![Live app](https://img.shields.io/badge/Live_app-Streamlit_Cloud-0068C9?style=flat-square)](https://europatipset-optimizer.streamlit.app)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.57-0068C9?style=flat-square&logo=streamlit&logoColor=white)](https://streamlit.io)
+[![Europatipset](https://img.shields.io/badge/Game-Europatipset-0068C9?style=flat-square)](https://www.svenskaspel.se/europatipset)
+[![Topics](https://img.shields.io/badge/Topics-football·ML·SE-0068C9?style=flat-square)](https://github.com/Elli2022/europatipset-optimizer/topics)
+
 A Python + Streamlit app that helps you build **Europatipset** systems under a row budget, using calibrated 1X2 probabilities, public Svenska Spel signals, and a play journal that learns from past rounds.
 
 ![Europatipset Optimizer UI](docs/app-screenshot.png)
